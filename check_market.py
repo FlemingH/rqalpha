@@ -26,7 +26,7 @@ def check():
         bs.login()
 
         today = datetime.date.today().strftime("%Y-%m-%d")
-        start = (datetime.date.today() - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
+        start = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
         rs = bs.query_history_k_data_plus(
             "sh.000300", "date,close",
