@@ -295,18 +295,32 @@ def _write_cache(ticker, date_str, df):
     df.to_csv(p, index=False)
 
 
+def _detect_latest_trading_day(start_str, end_str):
+    """用 S&P 500 指数探测最新交易日，返回日期字符串或 None。"""
+    df = _stooq_fetch("^spx", start_str, end_str)
+    if df is not None and len(df) >= 1:
+        return str(df["date"].iloc[-1])
+    return None
+
+
 def fetch_us_bars(tickers, days=100):
     """
     用 Stooq 逐只下载行情数据，带本地缓存。
-    每天第一次运行从 Stooq 下载并缓存，后续运行直接读缓存。
+    缓存按最新交易日隔离，开盘前/收盘后运行不会互相覆盖。
     返回 {ticker: DataFrame} 字典。
     """
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
-    cache_key = end.strftime("%Y-%m-%d")
-    print(f"  数据范围: {start_str} ~ {end_str}")
+
+    latest_day = _detect_latest_trading_day(start_str, end_str)
+    if latest_day:
+        cache_key = latest_day
+        print(f"  数据范围: {start_str} ~ {end_str}  (最新交易日: {cache_key})")
+    else:
+        cache_key = end.strftime("%Y-%m-%d")
+        print(f"  数据范围: {start_str} ~ {end_str}  (未探测到交易日，用今天日期)")
 
     results = {}
     fail = 0
@@ -358,14 +372,15 @@ def fetch_us_bars(tickers, days=100):
         time.sleep(0.3)
 
     print(f"  获取成功: {len(results)} 只 (缓存: {from_cache}, 新下载: {from_net}, 失败: {fail})")
-    return results
+    return results, cache_key
 
 
-def fetch_sp500_index(days=20):
+def fetch_sp500_index(days=20, cache_key=None):
     """获取 S&P 500 指数近期数据，返回 close 数组或 None。"""
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
-    cache_key = end.strftime("%Y-%m-%d")
+    if cache_key is None:
+        cache_key = end.strftime("%Y-%m-%d")
 
     df = _read_cache("_SPX_INDEX", cache_key)
     if df is None:
@@ -682,12 +697,12 @@ def main():
     print("=" * 70)
     print("  下载行情数据...")
     print("=" * 70)
-    bars_dict = fetch_us_bars(tickers, days=100)
+    bars_dict, cache_key = fetch_us_bars(tickers, days=100)
 
     passed = prefilter(bars_dict)
 
     idx_ret5 = 0.0
-    idx_close = fetch_sp500_index(days=20)
+    idx_close = fetch_sp500_index(days=20, cache_key=cache_key)
     if idx_close is not None and len(idx_close) >= 5:
         idx_ret5 = idx_close[-1] / idx_close[-5] - 1
         print(f"\n  S&P 500 近 5 日涨幅: {idx_ret5:+.2%}")

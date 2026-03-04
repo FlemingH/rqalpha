@@ -5,6 +5,8 @@ MACD 反转选股脚本（与回测 v3 同步）
 用 MACD 指标选出处于底部、即将反转的 A 股：
   1. bundle 本地预筛：基本面过滤 + MACD 底部反转信号（~2 秒）
   2. BaoStock 在线获取最新数据 + MACD 反转精选 Top 10（~30 秒）
+     带本地缓存：每天第一次运行从 BaoStock 下载并缓存到 .cn_cache/
+     后续运行直接读缓存，结果稳定且速度快
 
 MACD 反转选股逻辑（与 backtest_macd.py v3 一致）：
   - 零轴下方金叉（DIF 从下穿上 DEA，两者均 < 0）
@@ -17,6 +19,7 @@ MACD 反转选股逻辑（与 backtest_macd.py v3 一致）：
 运行：conda activate rqalpha && python screener_macd.py
 """
 import os
+import pathlib
 import sys
 import time
 import datetime
@@ -26,6 +29,35 @@ import h5py
 from tqdm import tqdm
 
 from bs_utils import fetch_bars, rq_to_bs, fetch_stock_name
+
+# =====================================================================
+#  本地缓存
+# =====================================================================
+
+_CACHE_DIR = pathlib.Path(__file__).resolve().parent / ".cn_cache"
+
+
+def _cache_path(rq_id, date_str):
+    return _CACHE_DIR / date_str / f"{rq_id.replace('.', '_')}.csv"
+
+
+def _read_cache(rq_id, date_str):
+    p = _cache_path(rq_id, date_str)
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p)
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df if len(df) >= 5 else None
+    except Exception:
+        return None
+
+
+def _write_cache(rq_id, date_str, df):
+    p = _cache_path(rq_id, date_str)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False)
 
 
 # =====================================================================
@@ -110,14 +142,13 @@ def online_score(rq_ids):
     today_str = today.strftime("%Y-%m-%d")
     print(f"  数据范围: {start} ~ {today_str}")
 
+    # 沪深 300 指数（同时探测最新交易日作为 cache key）
     idx_ret5 = 0.0
+    idx_df = None
     for _retry in range(3):
         try:
             idx_df = fetch_bars("sh.000300", start, today_str)
             if idx_df is not None and len(idx_df) >= 5:
-                idx_close = idx_df["close"].values
-                idx_ret5 = idx_close[-1] / idx_close[-5] - 1
-                print(f"  沪深300 近5日涨幅: {idx_ret5:+.2%}")
                 break
             else:
                 print(f"  沪深300 数据不足，重试 {_retry+1}/3...")
@@ -128,12 +159,33 @@ def online_score(rq_ids):
     else:
         print("  沪深300 获取失败，相对强度因子设为 0")
 
-    candidates = []
+    if idx_df is not None and len(idx_df) >= 5:
+        cache_key = str(idx_df["date"].iloc[-1])
+        idx_close = idx_df["close"].values
+        idx_ret5 = idx_close[-1] / idx_close[-5] - 1
+        _write_cache("_IDX_000300", cache_key, idx_df)
+        print(f"  沪深300 近5日涨幅: {idx_ret5:+.2%}")
+        print(f"  最新交易日: {cache_key}")
+    else:
+        cache_key = today.strftime("%Y-%m-%d")
+
+    # 检查缓存情况
+    cache_dir = _CACHE_DIR / cache_key
+    cached_ids = set()
+    if cache_dir.exists():
+        cached_ids = {p.stem.replace("_", ".") for p in cache_dir.glob("*.csv")
+                      if not p.stem.startswith("_")}
+    need_download = [rid for rid in rq_ids if rid not in cached_ids]
+    have_cache = [rid for rid in rq_ids if rid in cached_ids]
+    if have_cache:
+        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
+
+    # 先从网络下载缺失的数据
     fail = 0
     consecutive_fail = 0
     base_sleep = 0.3
-
-    for rq_id in tqdm(rq_ids, desc="  获取中", ncols=70, file=sys.stdout):
+    for rq_id in tqdm(need_download, desc="  下载中", ncols=70, file=sys.stdout,
+                      disable=not need_download):
         if consecutive_fail >= 10:
             tqdm.write("  ⚠ 连续失败 10 次，BaoStock 可能限流，等待 30 秒...")
             time.sleep(30)
@@ -147,12 +199,26 @@ def online_score(rq_ids):
 
         bs_code = rq_to_bs(rq_id)
         df = fetch_bars(bs_code, start, today_str)
-        if df is None or len(df) < 26:
+        if df is not None and len(df) >= 26:
+            _write_cache(rq_id, cache_key, df)
+            consecutive_fail = 0
+        else:
             fail += 1
             consecutive_fail += 1
+
+    if need_download:
+        print(f"  新下载: {len(need_download) - fail} 只, 失败: {fail}")
+
+    # 统一从缓存读取并分析
+    candidates = []
+    analyze_fail = 0
+
+    for rq_id in tqdm(rq_ids, desc="  分析中", ncols=70, file=sys.stdout):
+        df = _read_cache(rq_id, cache_key)
+        if df is None or len(df) < 26:
+            analyze_fail += 1
             continue
 
-        consecutive_fail = 0
         close = df["close"].values
         volume = df["volume"].values
         high = df["high"].values
@@ -324,11 +390,10 @@ def online_score(rq_ids):
             "score": score,
         })
 
-    print(f"  通过筛选: {len(candidates)} 只 (获取失败: {fail})")
+    print(f"  通过筛选: {len(candidates)} 只 (数据缺失: {analyze_fail})")
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top = candidates[:10]
 
-    # 只对 Top 10 获取股票名称
     if top:
         print(f"  获取 Top {len(top)} 名称...")
         for c in top:
