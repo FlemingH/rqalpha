@@ -5,7 +5,7 @@
 检查 S&P 500 的 MA5 vs MA10，判断明天是否可以操作。
 美股收盘后运行（北京时间早上 5:00 以后任何时间都行）。
 
-数据源: Stooq（免费、无限流）
+数据源: Stooq（免费、无需注册）
 运行：python check_market_us.py
 """
 import datetime
@@ -24,7 +24,7 @@ def _stooq_fetch(symbol, start_str, end_str, timeout=10):
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
         content = resp.read().decode()
-        if "No data" in content or len(content.strip()) < 30:
+        if "Exceeded" in content or "No data" in content or len(content.strip()) < 30:
             return None
         df = pd.read_csv(io.StringIO(content))
         df.columns = [c.strip().lower() for c in df.columns]
@@ -42,15 +42,14 @@ def check():
     start_str = start.strftime("%Y-%m-%d")
     end_str = today.strftime("%Y-%m-%d")
 
-    # S&P 500 指数
     df = _stooq_fetch("^spx", start_str, end_str)
     if df is None or len(df) < 10:
-        # 重试一次
         df = _stooq_fetch("^spx", start_str, end_str)
 
     if df is None or len(df) < 10:
         n = len(df) if df is not None else 0
         print(f"  数据不足（只有 {n} 天），无法判断")
+        print("  可能 Stooq 每日限额已用完，请明天再试")
         return
 
     closes = df["close"].values.tolist()

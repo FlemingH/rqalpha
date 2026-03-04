@@ -3,14 +3,14 @@
 MACD 反转选股脚本 — 美股版
 
 用 MACD 指标选出处于底部、即将反转的美股：
-  1. 获取股票池（支持三种范围），Stooq 逐只获取行情
+  1. 获取股票池（支持三种范围），Tiingo 逐只获取行情
   2. 基本面过滤（价格、成交额）
   3. MACD 反转信号检测 + 综合打分 → Top 10
 
 股票池范围（通过 --scope 参数选择）：
-  index  — 三大指数并集: S&P 500 + 纳斯达克 100 + 道琼斯 30 ~516 只（默认，~3 分钟）
-  main   — 主板全部：NASDAQ 大中盘 + NYSE ~5300 只（~30 分钟）
-  all    — 全美股：含 NASDAQ 小盘 + AMEX ~7300 只（~40 分钟）
+  index  — 三大指数并集: S&P 500 + 纳斯达克 100 + 道琼斯 30 ~516 只（默认）
+  main   — 主板全部：NASDAQ 大中盘 + NYSE ~5300 只
+  all    — 全美股：含 NASDAQ 小盘 + AMEX ~7300 只
 
 MACD 反转选股逻辑（与 A 股版 screener_macd.py 一致）：
   - 零轴下方金叉（DIF 从下穿上 DEA，两者均 < 0）
@@ -20,13 +20,17 @@ MACD 反转选股逻辑（与 A 股版 screener_macd.py 一致）：
   - 短期动量确认（close ≥ EMA5 × 0.99，防止假反转）
   - 相对强度因子（近 5 日跑赢 S&P 500 越多越好）
 
-数据源: Stooq（免费、无限流）
+数据源: Stooq（免费、无需注册）+ 本地缓存
+  每天第一次运行从 Stooq 下载并缓存到 .us_cache/ 目录
+  后续运行直接读缓存，结果稳定且不消耗 Stooq 配额
 运行：
   python screener_macd_us.py                  # 默认三大指数并集
   python screener_macd_us.py --scope main     # 主板全部
   python screener_macd_us.py --scope all      # 全美股
 """
 import argparse
+import os
+import pathlib
 import time
 import datetime
 import urllib.request
@@ -34,6 +38,24 @@ import io
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+
+def _load_env():
+    """从脚本同目录的 .env 文件加载环境变量（不覆盖已有值）。"""
+    env_path = pathlib.Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_env()
 
 
 # =====================================================================
@@ -215,8 +237,11 @@ def calc_macd(close, fast=12, slow=26, signal=9):
 
 
 # =====================================================================
-#  Stooq 数据获取
+#  Stooq 数据获取 + 本地缓存
 # =====================================================================
+
+_CACHE_DIR = pathlib.Path(__file__).resolve().parent / ".us_cache"
+
 
 def _stooq_fetch(symbol, start_str, end_str, timeout=10):
     """
@@ -230,7 +255,7 @@ def _stooq_fetch(symbol, start_str, end_str, timeout=10):
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
         content = resp.read().decode()
-        if "No data" in content or len(content.strip()) < 30:
+        if "Exceeded" in content or "No data" in content or len(content.strip()) < 30:
             return None
         df = pd.read_csv(io.StringIO(content))
         if len(df) < 5:
@@ -246,31 +271,93 @@ def _stooq_fetch(symbol, start_str, end_str, timeout=10):
         return None
 
 
+def _cache_path(ticker, date_str):
+    """返回某只股票某天的缓存文件路径。"""
+    return _CACHE_DIR / date_str / f"{ticker}.csv"
+
+
+def _read_cache(ticker, date_str):
+    """从本地缓存读取，返回 DataFrame 或 None。"""
+    p = _cache_path(ticker, date_str)
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p)
+        return df if len(df) >= 5 else None
+    except Exception:
+        return None
+
+
+def _write_cache(ticker, date_str, df):
+    """将 DataFrame 写入本地缓存。"""
+    p = _cache_path(ticker, date_str)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False)
+
+
 def fetch_us_bars(tickers, days=100):
     """
-    用 Stooq 逐只下载行情数据。
+    用 Stooq 逐只下载行情数据，带本地缓存。
+    每天第一次运行从 Stooq 下载并缓存，后续运行直接读缓存。
     返回 {ticker: DataFrame} 字典。
     """
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
+    cache_key = end.strftime("%Y-%m-%d")
     print(f"  数据范围: {start_str} ~ {end_str}")
-    print(f"  正在下载 {len(tickers)} 只股票行情 (Stooq)...")
 
     results = {}
     fail = 0
+    from_cache = 0
+    from_net = 0
+    rate_limited = False
 
-    for ticker in tqdm(tickers, desc="  下载中", ncols=70):
+    cache_dir = _CACHE_DIR / cache_key
+    if cache_dir.exists():
+        cached_files = set(p.stem for p in cache_dir.glob("*.csv"))
+    else:
+        cached_files = set()
+
+    need_download = [t for t in tickers if t not in cached_files]
+    have_cache = [t for t in tickers if t in cached_files]
+
+    if have_cache:
+        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
+    else:
+        print(f"  正在下载 {len(tickers)} 只股票行情 (Stooq)...")
+
+    for ticker in tqdm(have_cache, desc="  读缓存", ncols=70, disable=not have_cache):
+        df = _read_cache(ticker, cache_key)
+        if df is not None and len(df) >= 26:
+            results[ticker] = df
+            from_cache += 1
+        else:
+            need_download.append(ticker)
+
+    consecutive_fail = 0
+    for ticker in tqdm(need_download, desc="  下载中", ncols=70, disable=not need_download):
+        if rate_limited:
+            fail += 1
+            continue
         stooq_sym = ticker.lower().replace(".", "-") + ".us"
         df = _stooq_fetch(stooq_sym, start_str, end_str)
         if df is not None and len(df) >= 26:
             results[ticker] = df
+            _write_cache(ticker, cache_key, df)
+            from_net += 1
+            consecutive_fail = 0
         else:
             fail += 1
+            consecutive_fail += 1
+            if consecutive_fail >= 30 and from_net == 0 and from_cache == 0:
+                tqdm.write("  ⚠ 连续 30 只失败，Stooq 可能限流，停止下载")
+                tqdm.write("    请稍后重试（Stooq 限额每天 UTC 0:00 重置）")
+                rate_limited = True
         time.sleep(0.3)
 
-    print(f"  获取成功: {len(results)} 只 (失败: {fail})")
+    print(f"  获取成功: {len(results)} 只 (缓存: {from_cache}, 新下载: {from_net}, 失败: {fail})")
     return results
 
 
@@ -278,7 +365,14 @@ def fetch_sp500_index(days=20):
     """获取 S&P 500 指数近期数据，返回 close 数组或 None。"""
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
-    df = _stooq_fetch("^spx", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    cache_key = end.strftime("%Y-%m-%d")
+
+    df = _read_cache("_SPX_INDEX", cache_key)
+    if df is None:
+        df = _stooq_fetch("^spx", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if df is not None and len(df) >= 5:
+            _write_cache("_SPX_INDEX", cache_key, df)
+
     if df is not None and len(df) >= 5:
         return df["close"].values
     return None
@@ -578,7 +672,7 @@ def main():
 
     print("=" * 70)
     print("  MACD 反转选股 — 美股版")
-    print("  数据源: Stooq")
+    print("  数据源: Stooq + 本地缓存")
     print("=" * 70)
     print()
 
@@ -592,7 +686,6 @@ def main():
 
     passed = prefilter(bars_dict)
 
-    # S&P 500 指数近 5 日涨幅（相对强度基准）
     idx_ret5 = 0.0
     idx_close = fetch_sp500_index(days=20)
     if idx_close is not None and len(idx_close) >= 5:

@@ -21,5 +21,6 @@ persist/
 rqalpha_test_coverage_report/
 .tmp.pkl
 .env
+.us_cache/
 .DS_Store
 rqalpha/_version.py
