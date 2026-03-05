@@ -9,10 +9,13 @@
 运行：python check_market_us.py
 """
 import datetime
+import pathlib
 import urllib.request
 import io
 import numpy as np
 import pandas as pd
+
+_CACHE_DIR = pathlib.Path(__file__).resolve().parent / ".us_cache"
 
 
 def _stooq_fetch(symbol, start_str, end_str, timeout=10):
@@ -36,6 +39,24 @@ def _stooq_fetch(symbol, start_str, end_str, timeout=10):
         return None
 
 
+def _read_spx_cache(today_str):
+    """从 .us_cache 中读取已有的 S&P 500 缓存。"""
+    cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
+    for d in reversed(cache_dirs):
+        if d.is_dir() and d.name <= today_str:
+            spx = d / "_SPX_INDEX.csv"
+            if spx.exists():
+                try:
+                    df = pd.read_csv(spx)
+                    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+                    df = df.dropna(subset=["close"])
+                    if len(df) >= 10:
+                        return df
+                except Exception:
+                    pass
+    return None
+
+
 def check():
     today = datetime.date.today()
     start = today - datetime.timedelta(days=30)
@@ -45,6 +66,11 @@ def check():
     df = _stooq_fetch("^spx", start_str, end_str)
     if df is None or len(df) < 10:
         df = _stooq_fetch("^spx", start_str, end_str)
+
+    if df is None or len(df) < 10:
+        df = _read_spx_cache(end_str)
+        if df is not None:
+            print("  Stooq 不可用，使用本地缓存数据")
 
     if df is None or len(df) < 10:
         n = len(df) if df is not None else 0

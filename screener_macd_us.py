@@ -295,8 +295,19 @@ def _write_cache(ticker, date_str, df):
     df.to_csv(p, index=False)
 
 
-def _detect_latest_trading_day(start_str, end_str):
-    """用 S&P 500 指数探测最新交易日，返回日期字符串或 None。"""
+def _detect_cache_key(today_str):
+    """从本地缓存目录推断最新交易日（避免依赖网络请求）。"""
+    cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
+    for d in reversed(cache_dirs):
+        if d.is_dir() and d.name <= today_str:
+            spx = d / "_SPX_INDEX.csv"
+            if spx.exists():
+                return d.name
+    return None
+
+
+def _detect_latest_trading_day_online(start_str, end_str):
+    """用 S&P 500 指数在线探测最新交易日，返回日期字符串或 None。"""
     df = _stooq_fetch("^spx", start_str, end_str)
     if df is not None and len(df) >= 1:
         return str(df["date"].iloc[-1])
@@ -306,21 +317,29 @@ def _detect_latest_trading_day(start_str, end_str):
 def fetch_us_bars(tickers, days=100):
     """
     用 Stooq 逐只下载行情数据，带本地缓存。
-    缓存按最新交易日隔离，开盘前/收盘后运行不会互相覆盖。
-    返回 {ticker: DataFrame} 字典。
+    优先从本地缓存目录推断 cache_key，网络不可用时也能读到旧数据。
+    返回 {ticker: DataFrame} 字典和 cache_key。
     """
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
 
-    latest_day = _detect_latest_trading_day(start_str, end_str)
-    if latest_day:
-        cache_key = latest_day
+    # 优先从本地缓存推断 cache_key，避免 Stooq 限流导致无法读取旧数据
+    local_key = _detect_cache_key(end_str)
+
+    # 尝试在线探测最新交易日
+    online_key = _detect_latest_trading_day_online(start_str, end_str)
+
+    if online_key:
+        cache_key = online_key
         print(f"  数据范围: {start_str} ~ {end_str}  (最新交易日: {cache_key})")
+    elif local_key:
+        cache_key = local_key
+        print(f"  数据范围: {start_str} ~ {end_str}  (Stooq不可用, 读取缓存: {cache_key})")
     else:
-        cache_key = end.strftime("%Y-%m-%d")
-        print(f"  数据范围: {start_str} ~ {end_str}  (未探测到交易日，用今天日期)")
+        cache_key = end_str
+        print(f"  数据范围: {start_str} ~ {end_str}  (无缓存且Stooq不可用, 用今天日期)")
 
     results = {}
     fail = 0
@@ -367,7 +386,7 @@ def fetch_us_bars(tickers, days=100):
             consecutive_fail += 1
             if consecutive_fail >= 30 and from_net == 0 and from_cache == 0:
                 tqdm.write("  ⚠ 连续 30 只失败，Stooq 可能限流，停止下载")
-                tqdm.write("    请稍后重试（Stooq 限额每天 UTC 0:00 重置）")
+                tqdm.write("    请稍后重试（Stooq 限额通常在 UTC 01:00 左右重置）")
                 rate_limited = True
         time.sleep(0.3)
 
