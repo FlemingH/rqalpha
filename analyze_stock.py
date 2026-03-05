@@ -52,6 +52,18 @@ def _write_cache(rq_id, date_str, df):
     df.to_csv(p, index=False)
 
 
+def _purge_old_cache(keep=3):
+    """保留最近 keep 个缓存目录，删除更早的。"""
+    import shutil
+    if not _CACHE_DIR.exists():
+        return
+    dirs = sorted(d for d in _CACHE_DIR.iterdir() if d.is_dir())
+    if len(dirs) <= keep:
+        return
+    for d in dirs[:-keep]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # =====================================================================
 #  默认持仓  —  格式: { "代码": 成本价 }
 #  请在此处填写你的实际持仓成本价
@@ -137,8 +149,17 @@ def _detect_cache_key(today_str):
     return None
 
 
+def _data_date(df):
+    """从 DataFrame 中提取最新数据日期。"""
+    if df is not None and "date" in df.columns and len(df) > 0:
+        return str(df["date"].iloc[-1])
+    return "N/A"
+
+
 def fetch_data(rq_ids, days=120):
     """获取多只股票行情，返回 {rq_id: DataFrame} 和 cache_key。"""
+    _purge_old_cache(keep=3)
+
     today = datetime.date.today()
     start_dt = today - datetime.timedelta(days=days)
     start = start_dt.strftime("%Y-%m-%d")
@@ -163,22 +184,36 @@ def fetch_data(rq_ids, days=120):
     else:
         print(f"  沪深300数据: 读取缓存, cache_key={cache_key}")
 
+    from_cache = 0
+    from_net = 0
+    fail = 0
+    cache_dates = set()
+    net_dates = set()
     results = {}
-    miss = 0
     for rq_id in rq_ids:
         df = _read_cache(rq_id, cache_key)
-        if df is None:
+        if df is not None:
+            results[rq_id] = df
+            from_cache += 1
+            cache_dates.add(_data_date(df))
+        else:
             bs_code = rq_to_bs(rq_id)
             time.sleep(0.3)
             df = fetch_bars(bs_code, start, today_str)
             if df is not None and len(df) >= 5:
                 _write_cache(rq_id, cache_key, df)
-                miss += 1
-        if df is not None:
-            results[rq_id] = df
+                results[rq_id] = df
+                from_net += 1
+                net_dates.add(_data_date(df))
+            else:
+                fail += 1
 
-    if miss > 0:
-        print(f"  新下载: {miss} 只")
+    print(f"  ┌─ 数据获取汇总 ─────────────────────────────┐")
+    print(f"  │  本地缓存: {from_cache:>3} 只  数据日期: {', '.join(sorted(cache_dates)) or 'N/A':>10s}  │")
+    print(f"  │  网络下载: {from_net:>3} 只  数据日期: {', '.join(sorted(net_dates)) or 'N/A':>10s}  │")
+    print(f"  │  获取失败: {fail:>3} 只                           │")
+    print(f"  │  合计可用: {len(results):>3} / {len(rq_ids)} 只                      │")
+    print(f"  └───────────────────────────────────────────┘")
 
     idx_df = _read_cache("_IDX_000300", cache_key)
     return results, idx_df, cache_key

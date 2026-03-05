@@ -60,6 +60,18 @@ def _write_cache(rq_id, date_str, df):
     df.to_csv(p, index=False)
 
 
+def _purge_old_cache(keep=3):
+    """保留最近 keep 个缓存目录，删除更早的。"""
+    import shutil
+    if not _CACHE_DIR.exists():
+        return
+    dirs = sorted(d for d in _CACHE_DIR.iterdir() if d.is_dir())
+    if len(dirs) <= keep:
+        return
+    for d in dirs[:-keep]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # =====================================================================
 #  EMA / MACD 计算
 # =====================================================================
@@ -136,6 +148,7 @@ def online_score(rq_ids):
     print("  第 2 步：BaoStock 在线获取 + MACD 反转精选")
     print("=" * 70)
 
+    _purge_old_cache(keep=3)
     today = datetime.date.today()
     start_dt = today - datetime.timedelta(days=50)
     start = start_dt.strftime("%Y-%m-%d")
@@ -206,8 +219,14 @@ def online_score(rq_ids):
             fail += 1
             consecutive_fail += 1
 
-    if need_download:
-        print(f"  新下载: {len(need_download) - fail} 只, 失败: {fail}")
+    from_net = len(need_download) - fail
+    print()
+    print(f"  ┌─ 数据获取汇总 ─────────────────────────────┐")
+    print(f"  │  本地缓存: {len(have_cache):>4} 只  数据日期: {cache_key:>10s}  │")
+    print(f"  │  网络下载: {from_net:>4} 只  数据日期: {cache_key:>10s}  │")
+    print(f"  │  获取失败: {fail:>4} 只                           │")
+    print(f"  │  合计可用: {len(have_cache) + from_net:>4} / {len(rq_ids)} 只                  │")
+    print(f"  └───────────────────────────────────────────┘")
 
     # 统一从缓存读取并分析
     candidates = []

@@ -296,14 +296,36 @@ def _write_cache(ticker, date_str, df):
 
 
 def _detect_cache_key(today_str):
-    """从本地缓存目录推断最新交易日（避免依赖网络请求）。"""
+    """从本地缓存目录推断最新 cache_key（只要目录有足够 CSV 即视为有效）。"""
     cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
     for d in reversed(cache_dirs):
         if d.is_dir() and d.name <= today_str:
-            spx = d / "_SPX_INDEX.csv"
-            if spx.exists():
+            csv_count = sum(1 for _ in d.glob("*.csv"))
+            if csv_count >= 5:
                 return d.name
     return None
+
+
+def _find_all_cached(tickers, today_str):
+    """跨所有缓存目录搜索已缓存的股票，返回 {ticker: DataFrame}。"""
+    if not _CACHE_DIR.exists():
+        return {}
+    found = {}
+    remaining = set(tickers)
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+        if not d.is_dir() or d.name > today_str or not remaining:
+            continue
+        for ticker in list(remaining):
+            p = d / f"{ticker}.csv"
+            if p.exists():
+                try:
+                    df = pd.read_csv(p)
+                    if len(df) >= 26:
+                        found[ticker] = df
+                        remaining.discard(ticker)
+                except Exception:
+                    pass
+    return found
 
 
 def _detect_latest_trading_day_online(start_str, end_str):
@@ -314,10 +336,29 @@ def _detect_latest_trading_day_online(start_str, end_str):
     return None
 
 
+def _purge_old_cache(keep=3):
+    """保留最近 keep 个缓存目录，删除更早的。"""
+    import shutil
+    if not _CACHE_DIR.exists():
+        return
+    dirs = sorted(d for d in _CACHE_DIR.iterdir() if d.is_dir())
+    if len(dirs) <= keep:
+        return
+    for d in dirs[:-keep]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _data_date(df):
+    """从 DataFrame 中提取最新数据日期。"""
+    if df is not None and "date" in df.columns and len(df) > 0:
+        return str(df["date"].iloc[-1])
+    return "N/A"
+
+
 def fetch_us_bars(tickers, days=100):
     """
     用 Stooq 逐只下载行情数据，带本地缓存。
-    优先从本地缓存目录推断 cache_key，网络不可用时也能读到旧数据。
+    优先从本地缓存读取，缺失的从网络下载，网络也失败的从所有历史缓存中搜索。
     返回 {ticker: DataFrame} 字典和 cache_key。
     """
     end = datetime.date.today()
@@ -325,7 +366,10 @@ def fetch_us_bars(tickers, days=100):
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
 
-    # 优先从本地缓存推断 cache_key，避免 Stooq 限流导致无法读取旧数据
+    # 清理旧缓存，只保留最近 3 个目录
+    _purge_old_cache(keep=3)
+
+    # 优先从本地缓存推断 cache_key
     local_key = _detect_cache_key(end_str)
 
     # 尝试在线探测最新交易日
@@ -342,37 +386,43 @@ def fetch_us_bars(tickers, days=100):
         print(f"  数据范围: {start_str} ~ {end_str}  (无缓存且Stooq不可用, 用今天日期)")
 
     results = {}
-    fail = 0
     from_cache = 0
     from_net = 0
+    from_old = 0
     rate_limited = False
 
-    cache_dir = _CACHE_DIR / cache_key
-    if cache_dir.exists():
-        cached_files = set(p.stem for p in cache_dir.glob("*.csv"))
-    else:
-        cached_files = set()
+    # 搜索当前 cache_key 目录，以及 local_key 目录（可能不同）
+    cached_files = set()
+    for key in set(filter(None, [cache_key, local_key])):
+        cache_dir = _CACHE_DIR / key
+        if cache_dir.exists():
+            cached_files.update(p.stem for p in cache_dir.glob("*.csv"))
 
     need_download = [t for t in tickers if t not in cached_files]
     have_cache = [t for t in tickers if t in cached_files]
 
-    if have_cache:
-        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
-    else:
-        print(f"  正在下载 {len(tickers)} 只股票行情 (Stooq)...")
+    print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
 
+    # 第 1 轮：从缓存读取
+    cache_dates = set()
     for ticker in tqdm(have_cache, desc="  读缓存", ncols=70, disable=not have_cache):
         df = _read_cache(ticker, cache_key)
+        if df is None and local_key and local_key != cache_key:
+            df = _read_cache(ticker, local_key)
         if df is not None and len(df) >= 26:
             results[ticker] = df
             from_cache += 1
+            cache_dates.add(_data_date(df))
         else:
             need_download.append(ticker)
 
+    # 第 2 轮：从网络下载缺失的
     consecutive_fail = 0
+    net_failed = []
+    net_dates = set()
     for ticker in tqdm(need_download, desc="  下载中", ncols=70, disable=not need_download):
         if rate_limited:
-            fail += 1
+            net_failed.append(ticker)
             continue
         stooq_sym = ticker.lower().replace(".", "-") + ".us"
         df = _stooq_fetch(stooq_sym, start_str, end_str)
@@ -380,17 +430,40 @@ def fetch_us_bars(tickers, days=100):
             results[ticker] = df
             _write_cache(ticker, cache_key, df)
             from_net += 1
+            net_dates.add(_data_date(df))
             consecutive_fail = 0
         else:
-            fail += 1
+            net_failed.append(ticker)
             consecutive_fail += 1
             if consecutive_fail >= 30 and from_net == 0 and from_cache == 0:
                 tqdm.write("  ⚠ 连续 30 只失败，Stooq 可能限流，停止下载")
-                tqdm.write("    请稍后重试（Stooq 限额通常在 UTC 01:00 左右重置）")
+                tqdm.write("    请稍后重试（Stooq 限额约首次请求后 24 小时重置）")
                 rate_limited = True
         time.sleep(0.3)
 
-    print(f"  获取成功: {len(results)} 只 (缓存: {from_cache}, 新下载: {from_net}, 失败: {fail})")
+    # 第 3 轮：网络失败的从历史缓存兜底
+    old_dates = set()
+    if net_failed:
+        old_data = _find_all_cached(net_failed, end_str)
+        for ticker, df in old_data.items():
+            results[ticker] = df
+            from_old += 1
+            old_dates.add(_data_date(df))
+
+    still_missing = len(net_failed) - from_old
+
+    # 汇总输出
+    print()
+    print(f"  ┌─ 数据获取汇总 ──────────────────────────────────┐")
+    print(f"  │  本地缓存读取: {from_cache:>4} 只  数据日期: {', '.join(sorted(cache_dates)) or 'N/A':>10s}  │")
+    print(f"  │  网络新下载:   {from_net:>4} 只  数据日期: {', '.join(sorted(net_dates)) or 'N/A':>10s}  │")
+    if from_old > 0:
+        print(f"  │  历史缓存兜底: {from_old:>4} 只  数据日期: {', '.join(sorted(old_dates)) or 'N/A':>10s}  │")
+    print(f"  │  获取失败:     {still_missing:>4} 只                            │")
+    print(f"  │  ────────────────────────────────────────────── │")
+    print(f"  │  合计可用:     {len(results):>4} / {len(tickers)} 只                      │")
+    print(f"  └────────────────────────────────────────────────┘")
+
     return results, cache_key
 
 
