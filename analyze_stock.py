@@ -139,12 +139,13 @@ def _macd(close, fast=12, slow=26, signal=9):
 # =====================================================================
 
 def _detect_cache_key(today_str):
-    """尝试从已有缓存目录推断最新交易日（避免无谓的网络请求）。"""
-    cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
-    for d in reversed(cache_dirs):
+    """从已有缓存目录推断最新交易日（只要目录有足够 CSV 即视为有效）。"""
+    if not _CACHE_DIR.exists():
+        return None
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
         if d.is_dir() and d.name <= today_str:
-            idx = d / "_IDX_000300.csv"
-            if idx.exists():
+            csv_count = sum(1 for p in d.glob("*.csv") if not p.stem.startswith("_"))
+            if csv_count >= 2:
                 return d.name
     return None
 
@@ -156,6 +157,18 @@ def _data_date(df):
     return "N/A"
 
 
+def _read_idx_from_any_cache(today_str):
+    """跨所有缓存目录搜索沪深300指数数据。"""
+    if not _CACHE_DIR.exists():
+        return None
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+        if d.is_dir() and d.name <= today_str:
+            df = _read_cache("_IDX_000300", d.name)
+            if df is not None and len(df) >= 5:
+                return df
+    return None
+
+
 def fetch_data(rq_ids, days=120):
     """获取多只股票行情，返回 {rq_id: DataFrame} 和 cache_key。"""
     _purge_old_cache(keep=3)
@@ -165,57 +178,105 @@ def fetch_data(rq_ids, days=120):
     start = start_dt.strftime("%Y-%m-%d")
     today_str = today.strftime("%Y-%m-%d")
 
-    # 优先从本地缓存推断 cache_key，避免 BaoStock 偶发卡死
-    cache_key = _detect_cache_key(today_str)
-    idx_cached = _read_cache("_IDX_000300", cache_key) if cache_key else None
+    # 优先从本地缓存推断 cache_key
+    local_key = _detect_cache_key(today_str)
 
-    if idx_cached is None:
-        cache_key = today_str
-        for _retry in range(3):
-            try:
-                idx_df = fetch_bars("sh.000300", start, today_str)
-                if idx_df is not None and len(idx_df) >= 5:
-                    cache_key = str(idx_df["date"].iloc[-1])
-                    _write_cache("_IDX_000300", cache_key, idx_df)
-                    break
-            except Exception:
-                time.sleep(2 * (_retry + 1))
-        print(f"  沪深300数据: 在线获取, cache_key={cache_key}")
+    # 尝试在线获取沪深300（同时探测最新交易日）
+    idx_df = None
+    online_key = None
+    for _retry in range(3):
+        try:
+            idx_df = fetch_bars("sh.000300", start, today_str)
+            if idx_df is not None and len(idx_df) >= 5:
+                online_key = str(idx_df["date"].iloc[-1])
+                break
+        except Exception:
+            time.sleep(2 * (_retry + 1))
+
+    if online_key:
+        cache_key = online_key
+        _write_cache("_IDX_000300", cache_key, idx_df)
+        print(f"  沪深300数据: 在线获取, 最新交易日: {cache_key}")
+    elif local_key:
+        cache_key = local_key
+        idx_df = _read_idx_from_any_cache(today_str)
+        if idx_df is not None:
+            print(f"  沪深300数据: 读取缓存, 最新交易日: {cache_key}")
+        else:
+            print(f"  沪深300数据: BaoStock不可用且缓存无指数, cache_key={cache_key}")
     else:
-        print(f"  沪深300数据: 读取缓存, cache_key={cache_key}")
+        cache_key = today_str
+        print(f"  沪深300数据: 获取失败且无缓存, 回退为: {cache_key}")
 
+    # 检查缓存情况（同时查 cache_key 和 local_key 目录）
+    cached_ids = set()
+    for key in set(filter(None, [cache_key, local_key])):
+        d = _CACHE_DIR / key
+        if d.exists():
+            cached_ids.update(
+                p.stem.replace("_", ".") for p in d.glob("*.csv")
+                if not p.stem.startswith("_")
+            )
+    have_cache = [rid for rid in rq_ids if rid in cached_ids]
+    need_download = [rid for rid in rq_ids if rid not in cached_ids]
+
+    # 第 1 轮：从缓存读取（跨 cache_key / local_key 目录）
     from_cache = 0
-    from_net = 0
-    fail = 0
     cache_dates = set()
-    net_dates = set()
     results = {}
-    for rq_id in rq_ids:
+    for rq_id in have_cache:
         df = _read_cache(rq_id, cache_key)
+        if df is None and local_key and local_key != cache_key:
+            df = _read_cache(rq_id, local_key)
         if df is not None:
             results[rq_id] = df
             from_cache += 1
             cache_dates.add(_data_date(df))
+
+    # 第 2 轮：从网络下载缺失的
+    from_net = 0
+    net_failed = []
+    net_dates = set()
+    for rq_id in need_download:
+        bs_code = rq_to_bs(rq_id)
+        time.sleep(0.3)
+        df = fetch_bars(bs_code, start, today_str)
+        if df is not None and len(df) >= 5:
+            _write_cache(rq_id, cache_key, df)
+            results[rq_id] = df
+            from_net += 1
+            net_dates.add(_data_date(df))
         else:
-            bs_code = rq_to_bs(rq_id)
-            time.sleep(0.3)
-            df = fetch_bars(bs_code, start, today_str)
-            if df is not None and len(df) >= 5:
-                _write_cache(rq_id, cache_key, df)
-                results[rq_id] = df
-                from_net += 1
-                net_dates.add(_data_date(df))
-            else:
-                fail += 1
+            net_failed.append(rq_id)
+
+    # 第 3 轮：网络失败的从所有历史缓存兜底
+    from_old = 0
+    old_dates = set()
+    if net_failed and _CACHE_DIR.exists():
+        for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+            if not d.is_dir() or d.name > today_str or not net_failed:
+                continue
+            for rq_id in list(net_failed):
+                df = _read_cache(rq_id, d.name)
+                if df is not None and len(df) >= 5:
+                    results[rq_id] = df
+                    from_old += 1
+                    old_dates.add(_data_date(df))
+                    net_failed.remove(rq_id)
+
+    still_missing = len(net_failed)
 
     print(f"  ┌─ 数据获取汇总 ─────────────────────────────┐")
     print(f"  │  本地缓存: {from_cache:>3} 只  数据日期: {', '.join(sorted(cache_dates)) or 'N/A':>10s}  │")
     print(f"  │  网络下载: {from_net:>3} 只  数据日期: {', '.join(sorted(net_dates)) or 'N/A':>10s}  │")
-    print(f"  │  获取失败: {fail:>3} 只                           │")
+    if from_old > 0:
+        print(f"  │  历史兜底: {from_old:>3} 只  数据日期: {', '.join(sorted(old_dates)) or 'N/A':>10s}  │")
+    print(f"  │  获取失败: {still_missing:>3} 只                           │")
     print(f"  │  合计可用: {len(results):>3} / {len(rq_ids)} 只                      │")
     print(f"  └───────────────────────────────────────────┘")
 
-    idx_df = _read_cache("_IDX_000300", cache_key)
+    if idx_df is None:
+        idx_df = _read_idx_from_any_cache(today_str)
     return results, idx_df, cache_key
 
 

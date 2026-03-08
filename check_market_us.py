@@ -40,9 +40,10 @@ def _stooq_fetch(symbol, start_str, end_str, timeout=10):
 
 
 def _read_spx_cache(today_str):
-    """从 .us_cache 中读取已有的 S&P 500 缓存。"""
-    cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
-    for d in reversed(cache_dirs):
+    """从 .us_cache 中读取已有的 S&P 500 缓存（跨所有缓存目录搜索）。"""
+    if not _CACHE_DIR.exists():
+        return None
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
         if d.is_dir() and d.name <= today_str:
             spx = d / "_SPX_INDEX.csv"
             if spx.exists():

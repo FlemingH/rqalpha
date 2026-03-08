@@ -5,12 +5,38 @@
 检查沪深 300 的 MA5 vs MA10，判断明天是否可以操作。
 每天收盘后运行（17:00 以后任何时间都行）。
 
+数据源: BaoStock + .cn_cache 本地缓存回退
 运行：python check_market.py
 """
+import pathlib
 import signal
 import sys
 import datetime
 import numpy as np
+import pandas as pd
+
+_CACHE_DIR = pathlib.Path(__file__).resolve().parent / ".cn_cache"
+
+
+def _read_idx_cache(today_str):
+    """从 .cn_cache 中读取已有的沪深300缓存。"""
+    if not _CACHE_DIR.exists():
+        return None, None
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+        if d.is_dir() and d.name <= today_str:
+            p = d / "_IDX_000300.csv"
+            if p.exists():
+                try:
+                    df = pd.read_csv(p)
+                    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+                    df = df.dropna(subset=["close"])
+                    if len(df) >= 10:
+                        closes = df["close"].values.tolist()
+                        dates = df["date"].values.tolist()
+                        return closes, dates
+                except Exception:
+                    pass
+    return None, None
 
 
 def check():
@@ -21,6 +47,7 @@ def check():
 
     old = signal.signal(signal.SIGALRM, _alarm)
 
+    rows = []
     try:
         signal.alarm(10)
         bs.login()
@@ -33,7 +60,6 @@ def check():
             start_date=start, end_date=today,
             frequency="d", adjustflag="3",
         )
-        rows = []
         while rs.next():
             rows.append(rs.get_row_data())
         signal.alarm(0)
@@ -44,17 +70,22 @@ def check():
             bs.logout()
         except:
             pass
-        print(f"  获取数据失败: {e}")
-        return
+        print(f"  BaoStock 获取失败: {e}")
     finally:
         signal.signal(signal.SIGALRM, old)
 
-    if len(rows) < 10:
-        print(f"  数据不足（只有 {len(rows)} 天），无法判断")
-        return
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-    closes = [float(r[1]) for r in rows]
-    dates = [r[0] for r in rows]
+    if len(rows) >= 10:
+        closes = [float(r[1]) for r in rows]
+        dates = [r[0] for r in rows]
+    else:
+        closes, dates = _read_idx_cache(today_str)
+        if closes is not None:
+            print("  BaoStock 不可用，使用本地缓存数据")
+        else:
+            print(f"  数据不足（BaoStock: {len(rows)} 天，缓存: 无），无法判断")
+            return
 
     ma5 = np.mean(closes[-5:])
     ma10 = np.mean(closes[-10:])

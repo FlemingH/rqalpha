@@ -142,6 +142,49 @@ def local_prefilter(top_n=200):
 #  第 2 步：BaoStock 在线精选
 # =====================================================================
 
+def _detect_cache_key(today_str):
+    """从已有缓存目录推断最新交易日，避免 BaoStock 不可用时无法读缓存。"""
+    if not _CACHE_DIR.exists():
+        return None
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+        if d.is_dir() and d.name <= today_str:
+            csv_count = sum(1 for p in d.glob("*.csv") if not p.stem.startswith("_"))
+            if csv_count >= 5:
+                return d.name
+    return None
+
+
+def _find_all_cached(rq_ids, today_str):
+    """跨所有缓存目录搜索已缓存的股票，返回 {rq_id: DataFrame}。"""
+    if not _CACHE_DIR.exists():
+        return {}
+    found = {}
+    remaining = set(rq_ids)
+    for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+        if not d.is_dir() or d.name > today_str or not remaining:
+            continue
+        for rq_id in list(remaining):
+            p = d / f"{rq_id.replace('.', '_')}.csv"
+            if p.exists():
+                try:
+                    df = pd.read_csv(p)
+                    for col in df.columns[1:]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    if len(df) >= 26:
+                        found[rq_id] = df
+                        remaining.discard(rq_id)
+                except Exception:
+                    pass
+    return found
+
+
+def _data_date(df):
+    """从 DataFrame 中提取最新数据日期。"""
+    if df is not None and "date" in df.columns and len(df) > 0:
+        return str(df["date"].iloc[-1])
+    return "N/A"
+
+
 def online_score(rq_ids):
     print()
     print("=" * 70)
@@ -155,7 +198,10 @@ def online_score(rq_ids):
     today_str = today.strftime("%Y-%m-%d")
     print(f"  数据范围: {start} ~ {today_str}")
 
-    # 沪深 300 指数（同时探测最新交易日作为 cache key）
+    # 优先从本地缓存推断 cache_key，避免 BaoStock 不可用时丢失已有数据
+    local_key = _detect_cache_key(today_str)
+
+    # 沪深 300 指数（同时在线探测最新交易日作为 cache key）
     idx_ret5 = 0.0
     idx_df = None
     for _retry in range(3):
@@ -165,12 +211,10 @@ def online_score(rq_ids):
                 break
             else:
                 print(f"  沪深300 数据不足，重试 {_retry+1}/3...")
-                time.sleep(1)
+                time.sleep(2)
         except Exception:
             print(f"  沪深300 获取失败，重试 {_retry+1}/3...")
-            time.sleep(1)
-    else:
-        print("  沪深300 获取失败，相对强度因子设为 0")
+            time.sleep(2)
 
     if idx_df is not None and len(idx_df) >= 5:
         cache_key = str(idx_df["date"].iloc[-1])
@@ -178,25 +222,47 @@ def online_score(rq_ids):
         idx_ret5 = idx_close[-1] / idx_close[-5] - 1
         _write_cache("_IDX_000300", cache_key, idx_df)
         print(f"  沪深300 近5日涨幅: {idx_ret5:+.2%}")
-        print(f"  最新交易日: {cache_key}")
+        print(f"  最新交易日(在线): {cache_key}")
+    elif local_key:
+        cache_key = local_key
+        idx_df = _read_cache("_IDX_000300", cache_key)
+        if idx_df is None and _CACHE_DIR.exists():
+            for d in sorted(_CACHE_DIR.iterdir(), reverse=True):
+                if d.is_dir() and d.name <= today_str:
+                    idx_df = _read_cache("_IDX_000300", d.name)
+                    if idx_df is not None and len(idx_df) >= 5:
+                        break
+        if idx_df is not None and len(idx_df) >= 5:
+            idx_close = idx_df["close"].values
+            idx_ret5 = idx_close[-1] / idx_close[-5] - 1
+            print(f"  沪深300 近5日涨幅: {idx_ret5:+.2%}")
+        else:
+            print("  沪深300 缓存无指数数据，相对强度因子设为 0")
+        print(f"  最新交易日(缓存): {cache_key}")
     else:
-        cache_key = today.strftime("%Y-%m-%d")
+        cache_key = today_str
+        print("  沪深300 获取失败且无缓存，相对强度因子设为 0")
+        print(f"  cache_key 回退为: {cache_key}")
 
-    # 检查缓存情况
-    cache_dir = _CACHE_DIR / cache_key
+    # 检查缓存情况（同时查 cache_key 和 local_key 目录）
     cached_ids = set()
-    if cache_dir.exists():
-        cached_ids = {p.stem.replace("_", ".") for p in cache_dir.glob("*.csv")
-                      if not p.stem.startswith("_")}
+    for key in set(filter(None, [cache_key, local_key])):
+        d = _CACHE_DIR / key
+        if d.exists():
+            cached_ids.update(
+                p.stem.replace("_", ".") for p in d.glob("*.csv")
+                if not p.stem.startswith("_")
+            )
     need_download = [rid for rid in rq_ids if rid not in cached_ids]
     have_cache = [rid for rid in rq_ids if rid in cached_ids]
-    if have_cache:
-        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
+    print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
 
-    # 先从网络下载缺失的数据
-    fail = 0
+    # 第 1 轮：从网络下载缺失的数据
+    from_net = 0
     consecutive_fail = 0
+    net_failed = []
     base_sleep = 0.3
+    net_dates = set()
     for rq_id in tqdm(need_download, desc="  下载中", ncols=70, file=sys.stdout,
                       disable=not need_download):
         if consecutive_fail >= 10:
@@ -214,18 +280,45 @@ def online_score(rq_ids):
         df = fetch_bars(bs_code, start, today_str)
         if df is not None and len(df) >= 26:
             _write_cache(rq_id, cache_key, df)
+            from_net += 1
+            net_dates.add(_data_date(df))
             consecutive_fail = 0
         else:
-            fail += 1
+            net_failed.append(rq_id)
             consecutive_fail += 1
 
-    from_net = len(need_download) - fail
+    # 第 2 轮：从缓存读取（跨 cache_key / local_key 目录）
+    from_cache = 0
+    cache_dates = set()
+    for rq_id in have_cache:
+        df = _read_cache(rq_id, cache_key)
+        if df is None and local_key and local_key != cache_key:
+            df = _read_cache(rq_id, local_key)
+        if df is not None and len(df) >= 26:
+            _write_cache(rq_id, cache_key, df)
+            from_cache += 1
+            cache_dates.add(_data_date(df))
+
+    # 第 3 轮：网络失败的从所有历史缓存兜底
+    from_old = 0
+    old_dates = set()
+    if net_failed:
+        old_data = _find_all_cached(net_failed, today_str)
+        for rq_id, df in old_data.items():
+            _write_cache(rq_id, cache_key, df)
+            from_old += 1
+            old_dates.add(_data_date(df))
+
+    still_missing = len(net_failed) - from_old
+
     print()
     print(f"  ┌─ 数据获取汇总 ─────────────────────────────┐")
-    print(f"  │  本地缓存: {len(have_cache):>4} 只  数据日期: {cache_key:>10s}  │")
-    print(f"  │  网络下载: {from_net:>4} 只  数据日期: {cache_key:>10s}  │")
-    print(f"  │  获取失败: {fail:>4} 只                           │")
-    print(f"  │  合计可用: {len(have_cache) + from_net:>4} / {len(rq_ids)} 只                  │")
+    print(f"  │  本地缓存: {from_cache:>4} 只  数据日期: {', '.join(sorted(cache_dates)) or 'N/A':>10s}  │")
+    print(f"  │  网络下载: {from_net:>4} 只  数据日期: {', '.join(sorted(net_dates)) or 'N/A':>10s}  │")
+    if from_old > 0:
+        print(f"  │  历史兜底: {from_old:>4} 只  数据日期: {', '.join(sorted(old_dates)) or 'N/A':>10s}  │")
+    print(f"  │  获取失败: {still_missing:>4} 只                           │")
+    print(f"  │  合计可用: {from_cache + from_net + from_old:>4} / {len(rq_ids)} 只                  │")
     print(f"  └───────────────────────────────────────────┘")
 
     # 统一从缓存读取并分析
