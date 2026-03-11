@@ -244,18 +244,41 @@ def online_score(rq_ids):
         print("  沪深300 获取失败且无缓存，相对强度因子设为 0")
         print(f"  cache_key 回退为: {cache_key}")
 
+    # 检查缓存新鲜度：在线数据可用时，抽样验证缓存中数据日期是否匹配
+    force_refresh = False
+    if idx_df is not None and len(idx_df) >= 5:
+        ck_dir = _CACHE_DIR / cache_key
+        if ck_dir.exists():
+            sample_csvs = [
+                p for p in ck_dir.glob("*.csv") if not p.stem.startswith("_")
+            ]
+            if sample_csvs:
+                try:
+                    sdf = pd.read_csv(sample_csvs[0])
+                    cached_last = str(sdf["date"].iloc[-1])
+                    if cached_last < cache_key:
+                        force_refresh = True
+                        print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
+                except Exception:
+                    pass
+
     # 检查缓存情况（同时查 cache_key 和 local_key 目录）
-    cached_ids = set()
-    for key in set(filter(None, [cache_key, local_key])):
-        d = _CACHE_DIR / key
-        if d.exists():
-            cached_ids.update(
-                p.stem.replace("_", ".") for p in d.glob("*.csv")
-                if not p.stem.startswith("_")
-            )
-    need_download = [rid for rid in rq_ids if rid not in cached_ids]
-    have_cache = [rid for rid in rq_ids if rid in cached_ids]
-    print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
+    if force_refresh:
+        need_download = list(rq_ids)
+        have_cache = []
+        print(f"  本地缓存: 已失效, 需下载: {len(need_download)} 只")
+    else:
+        cached_ids = set()
+        for key in set(filter(None, [cache_key, local_key])):
+            d = _CACHE_DIR / key
+            if d.exists():
+                cached_ids.update(
+                    p.stem.replace("_", ".") for p in d.glob("*.csv")
+                    if not p.stem.startswith("_")
+                )
+        need_download = [rid for rid in rq_ids if rid not in cached_ids]
+        have_cache = [rid for rid in rq_ids if rid in cached_ids]
+        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
 
     # 第 1 轮：从网络下载缺失的数据
     from_net = 0
@@ -580,10 +603,38 @@ def output_result(top):
     print(f"  推荐关注: {ids}")
 
 
+_PICKS_DIR = pathlib.Path(__file__).resolve().parent / ".cn_picks"
+
+
+def _save_picks(top):
+    """保存推荐结果到本地 JSON，供 verify_picks.py 验证成功率。"""
+    if not top:
+        return
+    import json as _json
+    pick_date = str(top[0]["date"])
+    _PICKS_DIR.mkdir(parents=True, exist_ok=True)
+    picks = [
+        {
+            "rank": i + 1,
+            "id": c["id"],
+            "name": c["name"],
+            "price": round(float(c["price"]), 2),
+            "score": round(float(c["score"]), 3),
+            "status": c["status"],
+        }
+        for i, c in enumerate(top)
+    ]
+    path = _PICKS_DIR / f"{pick_date}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({"pick_date": pick_date, "picks": picks}, f, ensure_ascii=False, indent=2)
+    print(f"\n  推荐已保存: {path.name} ({len(picks)} 只，供 verify_picks.py 验证)")
+
+
 if __name__ == "__main__":
     t0 = time.time()
     pool = local_prefilter(200)
     rq_ids = [c["id"] for c in pool]
     top = online_score(rq_ids)
     output_result(top)
+    _save_picks(top)
     print(f"\n  总耗时: {time.time() - t0:.1f} 秒")

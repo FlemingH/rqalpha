@@ -23,5 +23,7 @@ rqalpha_test_coverage_report/
 .env
 .cn_cache/
 .us_cache/
+.cn_picks/
+.us_picks/
 .DS_Store
 rqalpha/_version.py

@@ -283,7 +283,11 @@ def _read_cache(ticker, date_str):
         return None
     try:
         df = pd.read_csv(p)
-        return df if len(df) >= 5 else None
+        if len(df) < 5:
+            return None
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
     except Exception:
         return None
 
@@ -300,7 +304,7 @@ def _detect_cache_key(today_str):
     cache_dirs = sorted(_CACHE_DIR.iterdir()) if _CACHE_DIR.exists() else []
     for d in reversed(cache_dirs):
         if d.is_dir() and d.name <= today_str:
-            csv_count = sum(1 for _ in d.glob("*.csv"))
+            csv_count = sum(1 for p in d.glob("*.csv") if not p.stem.startswith("_"))
             if csv_count >= 5:
                 return d.name
     return None
@@ -320,6 +324,8 @@ def _find_all_cached(tickers, today_str):
             if p.exists():
                 try:
                     df = pd.read_csv(p)
+                    for col in df.columns[1:]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
                     if len(df) >= 26:
                         found[ticker] = df
                         remaining.discard(ticker)
@@ -391,17 +397,41 @@ def fetch_us_bars(tickers, days=100):
     from_old = 0
     rate_limited = False
 
+    # 检查缓存新鲜度：在线数据可用时，抽样验证缓存中数据日期是否匹配
+    force_refresh = False
+    if online_key:
+        ck_dir = _CACHE_DIR / cache_key
+        if ck_dir.exists():
+            sample_csvs = [
+                p for p in ck_dir.glob("*.csv") if not p.stem.startswith("_")
+            ]
+            if sample_csvs:
+                try:
+                    sdf = pd.read_csv(sample_csvs[0])
+                    cached_last = str(sdf["date"].iloc[-1])
+                    if cached_last < cache_key:
+                        force_refresh = True
+                        print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
+                except Exception:
+                    pass
+
     # 搜索当前 cache_key 目录，以及 local_key 目录（可能不同）
-    cached_files = set()
-    for key in set(filter(None, [cache_key, local_key])):
-        cache_dir = _CACHE_DIR / key
-        if cache_dir.exists():
-            cached_files.update(p.stem for p in cache_dir.glob("*.csv"))
-
-    need_download = [t for t in tickers if t not in cached_files]
-    have_cache = [t for t in tickers if t in cached_files]
-
-    print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
+    if force_refresh:
+        need_download = list(tickers)
+        have_cache = []
+        print(f"  本地缓存: 已失效, 需下载: {len(need_download)} 只")
+    else:
+        cached_files = set()
+        for key in set(filter(None, [cache_key, local_key])):
+            cache_dir = _CACHE_DIR / key
+            if cache_dir.exists():
+                cached_files.update(
+                    p.stem for p in cache_dir.glob("*.csv")
+                    if not p.stem.startswith("_")
+                )
+        need_download = [t for t in tickers if t not in cached_files]
+        have_cache = [t for t in tickers if t in cached_files]
+        print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
 
     # 第 1 轮：从缓存读取
     cache_dates = set()
@@ -767,6 +797,32 @@ def output_result(top):
 #  主流程
 # =====================================================================
 
+_PICKS_DIR = pathlib.Path(__file__).resolve().parent / ".us_picks"
+
+
+def _save_picks(top):
+    """保存推荐结果到本地 JSON，供后续验证成功率。"""
+    if not top:
+        return
+    import json as _json
+    pick_date = str(top[0]["date"])
+    _PICKS_DIR.mkdir(parents=True, exist_ok=True)
+    picks = [
+        {
+            "rank": i + 1,
+            "ticker": c["ticker"],
+            "price": round(float(c["price"]), 2),
+            "score": round(float(c["score"]), 3),
+            "status": c["status"],
+        }
+        for i, c in enumerate(top)
+    ]
+    path = _PICKS_DIR / f"{pick_date}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({"pick_date": pick_date, "picks": picks}, f, ensure_ascii=False, indent=2)
+    print(f"\n  推荐已保存: {path.name} ({len(picks)} 只)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MACD 反转选股 — 美股版")
     parser.add_argument(
@@ -803,6 +859,7 @@ def main():
 
     top = score_reversal(bars_dict, passed, idx_ret5)
     output_result(top)
+    _save_picks(top)
 
     print(f"\n  总耗时: {time.time() - t0:.1f} 秒")
 
