@@ -351,6 +351,7 @@ def online_score(rq_ids):
 
     # 统一从缓存读取并分析
     candidates = []
+    watchlist = []
     analyze_fail = 0
 
     for rq_id in tqdm(rq_ids, desc="  分析中", ncols=70, file=sys.stdout):
@@ -470,6 +471,15 @@ def online_score(rq_ids):
             or hist_cross_zero
         )
         if not has_signal:
+            # 观察池：绿柱缩脚但信号未确认，可能即将反转
+            if hist_shrinking and dif[-1] < 0:
+                watchlist.append({
+                    "id": rq_id, "name": "", "price": close[-1],
+                    "date": latest_date, "dif": dif[-1], "dea": dea[-1],
+                    "hist": hist[-1], "shrink_days": shrink_days,
+                    "dif_turning": dif_turning,
+                    "dif_slope": dif[-1] - dif[-2] if n >= 2 else 0,
+                })
             continue
 
         # =====================================================
@@ -562,40 +572,78 @@ def online_score(rq_ids):
             bs_code = rq_to_bs(c["id"])
             c["name"] = fetch_stock_name(bs_code)
 
-    return top
+    # 观察池：按缩脚天数 + DIF 斜率排序，取 Top 10
+    watchlist.sort(key=lambda x: (x["shrink_days"], x["dif_slope"]), reverse=True)
+    watch_top = watchlist[:10]
+    if watch_top:
+        print(f"  获取观察池 Top {len(watch_top)} 名称...")
+        for c in watch_top:
+            time.sleep(0.3)
+            bs_code = rq_to_bs(c["id"])
+            c["name"] = fetch_stock_name(bs_code)
+
+    return top, watch_top
 
 
 # =====================================================================
 #  输出
 # =====================================================================
 
-def output_result(top):
+def output_result(top, watch_top=None):
     if not top:
         print("\n  没有符合条件的股票。")
-        return
-
-    print()
-    print("=" * 112)
-    print(f"  MACD 反转选股 TOP 10 (数据截至 {top[0]['date']})")
-    print("=" * 112)
-    print(
-        f"{'#':>3s}  {'代码':<14s} {'名称':<8s} {'现价':>7s} "
-        f"{'DIF':>7s} {'DEA':>7s} {'MACD柱':>7s} "
-        f"{'状态':<10s} {'背离':>4s} {'量比':>5s} {'得分':>5s}"
-    )
-    print("-" * 112)
-
-    ids = []
-    for i, c in enumerate(top):
-        diverge = "是" if c["diverge"] else "否"
+    else:
+        print()
+        print("=" * 112)
+        print(f"  MACD 反转选股 TOP 10 (数据截至 {top[0]['date']})")
+        print("=" * 112)
         print(
-            f"{i+1:>3d}  {c['id']:<14s} {c['name']:<8s} {c['price']:>7.2f} "
-            f"{c['dif']:>7.3f} {c['dea']:>7.3f} {c['hist']:>7.3f} "
-            f"{c['status']:<10s} {diverge:>4s} {c['vol_ratio']:>5.2f} {c['score']:>5.3f}"
+            f"{'#':>3s}  {'代码':<14s} {'名称':<8s} {'现价':>7s} "
+            f"{'DIF':>7s} {'DEA':>7s} {'MACD柱':>7s} "
+            f"{'状态':<10s} {'背离':>4s} {'量比':>5s} {'得分':>5s}"
         )
-        ids.append(f"{c['id']} {c['name']}")
+        print("-" * 112)
 
-    print("-" * 112)
+        ids = []
+        for i, c in enumerate(top):
+            diverge = "是" if c["diverge"] else "否"
+            print(
+                f"{i+1:>3d}  {c['id']:<14s} {c['name']:<8s} {c['price']:>7.2f} "
+                f"{c['dif']:>7.3f} {c['dea']:>7.3f} {c['hist']:>7.3f} "
+                f"{c['status']:<10s} {diverge:>4s} {c['vol_ratio']:>5.2f} {c['score']:>5.3f}"
+            )
+            ids.append(f"{c['id']} {c['name']}")
+
+        print("-" * 112)
+
+    # ===== 观察池输出 =====
+    if watch_top:
+        print()
+        print("=" * 100)
+        print(f"  观察池 TOP 10 — 绿柱缩脚，信号待确认（关注次日是否出金叉/柱过零轴）")
+        print("=" * 100)
+        print(
+            f"{'#':>3s}  {'代码':<14s} {'名称':<8s} {'现价':>7s} "
+            f"{'DIF':>8s} {'DEA':>8s} {'MACD柱':>8s} "
+            f"{'缩脚天数':>8s} {'DIF拐头':>6s} {'DIF斜率':>8s}"
+        )
+        print("-" * 100)
+        for i, c in enumerate(watch_top):
+            turning = "✓" if c["dif_turning"] else "—"
+            print(
+                f"{i+1:>3d}  {c['id']:<14s} {c['name']:<8s} {c['price']:>7.2f} "
+                f"{c['dif']:>8.3f} {c['dea']:>8.3f} {c['hist']:>8.3f} "
+                f"{c['shrink_days']:>8d} {turning:>6s} {c['dif_slope']:>+8.4f}"
+            )
+        print("-" * 100)
+        print()
+        print("  观察池说明:")
+        print("    这些股票 MACD 绿柱正在持续缩短（卖压减弱），但尚未触发明确买入信号。")
+        print("    缩脚天数越多 = 空头力量衰竭越久，越接近反转。")
+        print("    DIF拐头 ✓ = DIF 已开始上行，下一步可能出现金叉。")
+        print("    DIF斜率 > 0 = DIF 正在加速上行，信号确认在即。")
+        print("    操作建议: 加入自选，等待次日出现 零下金叉 / 柱过零轴 后再买入。")
+
     print()
     print("  MACD 反转选股逻辑（买在底部拐点）:")
     print("  ┌─ T+1 安全过滤（买入后次日才能卖出）────────────────┐")
@@ -623,6 +671,9 @@ def output_result(top):
     print("  │  ✓ 短期动量确认: close ≥ EMA5 × 0.99        过滤  │")
     print("  │      相对强度 = 近5日跑赢大盘越多越好        +0.05  │")
     print("  │      成交额因子 = 大成交额信号更可靠         +0.05  │")
+    print("  ├─ 观察池 ──────────────────────────────────────────┤")
+    print("  │  ○  绿柱缩脚 + DIF<0 但无主要信号 → 观察池        │")
+    print("  │     等待金叉/柱过零确认后买入，盈利空间可能更大     │")
     print("  └────────────────────────────────────────────────────┘")
     print()
     print("  信号强度排序: 背离金叉 > 底背离 > 二次金叉 > 零下金叉 > 柱过零轴 > 绿柱缩脚")
@@ -633,8 +684,9 @@ def output_result(top):
     print("    MACD柱 = (DIF - DEA) × 2（红绿柱）")
     print("    底背离 = 股价创新低但 MACD 不创新低（空方力竭，反转在即）")
     print("    零轴下方金叉 = DIF 在负值区域穿上 DEA（底部买入信号）")
-    print()
-    print(f"  推荐关注: {ids}")
+    if top:
+        print()
+        print(f"  推荐关注: {ids}")
 
 
 _PICKS_DIR = pathlib.Path(__file__).resolve().parent / ".cn_picks"
@@ -668,7 +720,7 @@ if __name__ == "__main__":
     t0 = time.time()
     pool = local_prefilter(200)
     rq_ids = [c["id"] for c in pool]
-    top = online_score(rq_ids)
-    output_result(top)
+    top, watch_top = online_score(rq_ids)
+    output_result(top, watch_top)
     _save_picks(top)
     print(f"\n  总耗时: {time.time() - t0:.1f} 秒")

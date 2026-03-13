@@ -573,6 +573,7 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
     print("=" * 70)
 
     candidates = []
+    watchlist = []
 
     for ticker in tqdm(tickers, desc="  分析中", ncols=70):
         df = bars_dict.get(ticker)
@@ -692,6 +693,14 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
             or hist_cross_zero
         )
         if not has_signal:
+            if hist_shrinking and dif[-1] < 0:
+                watchlist.append({
+                    "ticker": ticker, "price": close[-1],
+                    "date": latest_date, "dif": dif[-1], "dea": dea[-1],
+                    "hist": hist[-1], "shrink_days": shrink_days,
+                    "dif_turning": dif_turning,
+                    "dif_slope": dif[-1] - dif[-2] if n >= 2 else 0,
+                })
             continue
 
         # =====================================================
@@ -754,40 +763,72 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
 
     print(f"  通过筛选: {len(candidates)} 只")
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[:10]
+
+    watchlist.sort(key=lambda x: (x["shrink_days"], x["dif_slope"]), reverse=True)
+    watch_top = watchlist[:10]
+
+    return candidates[:10], watch_top
 
 
 # =====================================================================
 #  输出
 # =====================================================================
 
-def output_result(top):
+def output_result(top, watch_top=None):
     if not top:
         print("\n  没有符合条件的股票。")
-        return
-
-    print()
-    print("=" * 112)
-    print(f"  MACD 反转选股 TOP 10 — 美股 (数据截至 {top[0]['date']})")
-    print("=" * 112)
-    print(
-        f"{'#':>3s}  {'Ticker':<8s} {'Price':>8s} "
-        f"{'DIF':>8s} {'DEA':>8s} {'MACD':>8s} "
-        f"{'状态':<10s} {'背离':>4s} {'量比':>5s} {'得分':>5s}"
-    )
-    print("-" * 112)
-
-    tickers = []
-    for i, c in enumerate(top):
-        diverge = "是" if c["diverge"] else "否"
+    else:
+        print()
+        print("=" * 112)
+        print(f"  MACD 反转选股 TOP 10 — 美股 (数据截至 {top[0]['date']})")
+        print("=" * 112)
         print(
-            f"{i+1:>3d}  {c['ticker']:<8s} {c['price']:>8.2f} "
-            f"{c['dif']:>8.3f} {c['dea']:>8.3f} {c['hist']:>8.3f} "
-            f"{c['status']:<10s} {diverge:>4s} {c['vol_ratio']:>5.2f} {c['score']:>5.3f}"
+            f"{'#':>3s}  {'Ticker':<8s} {'Price':>8s} "
+            f"{'DIF':>8s} {'DEA':>8s} {'MACD':>8s} "
+            f"{'状态':<10s} {'背离':>4s} {'量比':>5s} {'得分':>5s}"
         )
-        tickers.append(c["ticker"])
+        print("-" * 112)
 
-    print("-" * 112)
+        tickers = []
+        for i, c in enumerate(top):
+            diverge = "是" if c["diverge"] else "否"
+            print(
+                f"{i+1:>3d}  {c['ticker']:<8s} {c['price']:>8.2f} "
+                f"{c['dif']:>8.3f} {c['dea']:>8.3f} {c['hist']:>8.3f} "
+                f"{c['status']:<10s} {diverge:>4s} {c['vol_ratio']:>5.2f} {c['score']:>5.3f}"
+            )
+            tickers.append(c["ticker"])
+
+        print("-" * 112)
+
+    # ===== 观察池输出 =====
+    if watch_top:
+        print()
+        print("=" * 100)
+        print(f"  观察池 TOP 10 — 绿柱缩脚，信号待确认（关注次日是否出金叉/柱过零轴）")
+        print("=" * 100)
+        print(
+            f"{'#':>3s}  {'Ticker':<8s} {'Price':>8s} "
+            f"{'DIF':>9s} {'DEA':>9s} {'MACD':>9s} "
+            f"{'缩脚天数':>8s} {'DIF拐头':>6s} {'DIF斜率':>9s}"
+        )
+        print("-" * 100)
+        for i, c in enumerate(watch_top):
+            turning = "✓" if c["dif_turning"] else "—"
+            print(
+                f"{i+1:>3d}  {c['ticker']:<8s} {c['price']:>8.2f} "
+                f"{c['dif']:>9.3f} {c['dea']:>9.3f} {c['hist']:>9.3f} "
+                f"{c['shrink_days']:>8d} {turning:>6s} {c['dif_slope']:>+9.4f}"
+            )
+        print("-" * 100)
+        print()
+        print("  观察池说明:")
+        print("    这些股票 MACD 绿柱正在持续缩短（卖压减弱），但尚未触发明确买入信号。")
+        print("    缩脚天数越多 = 空头力量衰竭越久，越接近反转。")
+        print("    DIF拐头 ✓ = DIF 已开始上行，下一步可能出现金叉。")
+        print("    DIF斜率 > 0 = DIF 正在加速上行，信号确认在即。")
+        print("    操作建议: 加入自选，等待次日出现 零下金叉 / 柱过零轴 后再买入。")
+
     print()
     print("  MACD 反转选股逻辑（买在底部拐点）:")
     print("  ┌─ 隔夜安全过滤 ──────────────────────────────────────┐")
@@ -815,6 +856,9 @@ def output_result(top):
     print("  │  ✓ 短期动量确认: close ≥ EMA5 × 0.99        过滤  │")
     print("  │      相对强度 = 近5日跑赢 S&P 500 越多越好   +0.05  │")
     print("  │      成交额因子 = 大成交额信号更可靠         +0.05  │")
+    print("  ├─ 观察池 ──────────────────────────────────────────┤")
+    print("  │  ○  绿柱缩脚 + DIF<0 但无主要信号 → 观察池        │")
+    print("  │     等待金叉/柱过零确认后买入，盈利空间可能更大     │")
     print("  └────────────────────────────────────────────────────┘")
     print()
     print("  信号强度排序: 背离金叉 > 底背离 > 二次金叉 > 零下金叉 > 柱过零轴 > 绿柱缩脚")
@@ -825,8 +869,9 @@ def output_result(top):
     print("    MACD柱 = (DIF - DEA) × 2（红绿柱）")
     print("    底背离 = 股价创新低但 MACD 不创新低（空方力竭，反转在即）")
     print("    零轴下方金叉 = DIF 在负值区域穿上 DEA（底部买入信号）")
-    print()
-    print(f"  推荐关注: {tickers}")
+    if top:
+        print()
+        print(f"  推荐关注: {tickers}")
 
 
 # =====================================================================
@@ -893,8 +938,8 @@ def main():
     else:
         print("\n  S&P 500 数据获取失败，相对强度因子设为 0")
 
-    top = score_reversal(bars_dict, passed, idx_ret5)
-    output_result(top)
+    top, watch_top = score_reversal(bars_dict, passed, idx_ret5)
+    output_result(top, watch_top)
     _save_picks(top)
 
     print(f"\n  总耗时: {time.time() - t0:.1f} 秒")
