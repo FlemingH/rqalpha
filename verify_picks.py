@@ -240,7 +240,6 @@ def _print_day_result(results, pick_date):
     if not results:
         return
 
-    verify_date = results[0]["verify_date"]
     up = [r for r in results if r["result"] == "涨"]
     down = [r for r in results if r["result"] == "跌"]
     flat = [r for r in results if r["result"] == "平"]
@@ -248,7 +247,7 @@ def _print_day_result(results, pick_date):
     avg_ret = np.mean([float(r["return_pct"]) for r in results])
 
     print()
-    print(f"  ┌─ 验证结果 ({pick_date} 推荐 → {verify_date} 收盘) ─────────┐")
+    print(f"  ┌─ {pick_date} 推荐验证结果 ───────────────────────┐")
     print(f"  │")
     print(f"  │  成功率: {win_rate:.0f}%  ({len(up)}涨 / {len(down)}跌"
           + (f" / {len(flat)}平" if flat else "") + ")")
@@ -280,9 +279,9 @@ def _print_cumulative(all_rows):
         return
 
     from collections import defaultdict
-    by_date = defaultdict(list)
+    by_pick = defaultdict(list)
     for r in all_rows:
-        by_date[r["verify_date"]].append(r)
+        by_pick[r["pick_date"]].append(r)
 
     total = len(all_rows)
     total_up = sum(1 for r in all_rows if r["result"] == "涨")
@@ -294,23 +293,22 @@ def _print_cumulative(all_rows):
     print("=" * 64)
     print("  累积统计")
     print("=" * 64)
-    print(f"  验证天数: {len(by_date)} 天, 共 {total} 只")
+    print(f"  验证天数: {len(by_pick)} 天, 共 {total} 只")
     print(f"  总成功率: {total_rate:.1f}% ({total_up}涨 / {total_down}跌)")
     print(f"  总平均涨幅: {total_avg:+.2f}%")
     print()
 
-    print(f"  {'验证日':>10s}  {'推荐日':>10s}  {'成功率':>6s}  {'平均涨幅':>8s}  {'涨':>2s}  {'跌':>2s}  涨的股票")
-    print("  " + "─" * 62)
+    print(f"  {'推荐日':>10s}  {'成功率':>6s}  {'平均涨幅':>8s}  {'涨':>2s}  {'跌':>2s}  涨的股票")
+    print("  " + "─" * 56)
 
-    for vdate in sorted(by_date.keys()):
-        rows = by_date[vdate]
+    for pdate in sorted(by_pick.keys()):
+        rows = by_pick[pdate]
         up_r = [r for r in rows if r["result"] == "涨"]
         dn_r = [r for r in rows if r["result"] == "跌"]
         rate = len(up_r) / len(rows) * 100
         avg = np.mean([float(r["return_pct"]) for r in rows])
-        pdate = rows[0]["pick_date"]
         up_names = ", ".join(r["stock_name"] or r["stock_id"] for r in up_r) if up_r else "—"
-        print(f"  {vdate:>10s}  {pdate:>10s}  {rate:>5.0f}%  {avg:>+7.2f}%  {len(up_r):>2d}  {len(dn_r):>2d}  {up_names}")
+        print(f"  {pdate:>10s}  {rate:>5.0f}%  {avg:>+7.2f}%  {len(up_r):>2d}  {len(dn_r):>2d}  {up_names}")
 
     print()
 
@@ -322,7 +320,6 @@ def _print_cumulative(all_rows):
 def main():
     parser = argparse.ArgumentParser(description="MACD 选股成功率验证（A股/美股）")
     parser.add_argument("--us", action="store_true", help="验证美股推荐（默认验证A股）")
-    parser.add_argument("--all", action="store_true", help="验证所有未验证的推荐")
     parser.add_argument("--stats", action="store_true", help="只显示累积统计")
     args = parser.parse_args()
 
@@ -359,9 +356,6 @@ def main():
         print("  所有推荐已验证完毕。")
         _print_cumulative(report_rows)
         return
-
-    if not args.all:
-        unverified = unverified[-1:]
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     new_total = 0
