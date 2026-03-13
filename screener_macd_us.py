@@ -397,7 +397,7 @@ def fetch_us_bars(tickers, days=100):
     from_old = 0
     rate_limited = False
 
-    # 检查缓存新鲜度：在线数据可用时，抽样验证缓存中数据日期是否匹配
+    # 检查缓存新鲜度：在线数据可用时，确保缓存是最新交易日的数据
     force_refresh = False
     if online_key:
         ck_dir = _CACHE_DIR / cache_key
@@ -414,6 +414,9 @@ def fetch_us_bars(tickers, days=100):
                         print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
                 except Exception:
                     pass
+        elif local_key and local_key != cache_key:
+            force_refresh = True
+            print(f"  ⚠ 新交易日 {cache_key}，缓存为 {local_key}，需要下载最新数据")
 
     # 搜索当前 cache_key 目录，以及 local_key 目录（可能不同）
     if force_refresh:
@@ -577,27 +580,54 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
             continue
 
         close = df["close"].values
+        opn = df["open"].values
         volume = df["volume"].values
         high = df["high"].values
         low = df["low"].values
         n = len(close)
+        latest_date = df["date"].iloc[-1] if "date" in df.columns else ""
 
-        if close[-1] == 0:
+        if close[-1] == 0 or n < 2:
             continue
 
-        # ===== 安全过滤（美股无涨停，但过滤极端情况）=====
-        if n >= 2 and abs(close[-1] / close[-2] - 1) > 0.25:
+        daily_ret = close[-1] / close[-2] - 1
+
+        # ===== 隔夜安全过滤 =====
+        # 1) 单日涨跌幅 >15%：事件驱动行情，隔夜风险极高
+        if abs(daily_ret) > 0.15:
             continue
+        # 2) 收盘偏高于日内均价：追高买入风险大
         day_avg = (high[-1] + low[-1] + close[-1]) / 3
         if close[-1] > day_avg * 1.05:
             continue
+        # 3) 异常放量（量比>5）：可能是财报/消息驱动
         vol_prev_avg = volume[-6:-1].mean() if n >= 6 else volume[:-1].mean()
         if vol_prev_avg > 0 and volume[-1] / vol_prev_avg > 5.0:
             continue
+        # 4) 收盘在日内低位（<20%）：尾盘抛售，次日惯性向下
         day_range = high[-1] - low[-1]
         close_pos = (close[-1] - low[-1]) / day_range if day_range > 0 else 0.5
         if close_pos < 0.20:
             continue
+        # 5) 大幅跳空高开（>5%）：缺口回补风险
+        gap_up = opn[-1] / close[-2] - 1
+        if gap_up > 0.05:
+            continue
+        # 6) 振幅过大（>10%）：日内波动太剧烈，隔夜不确定性高
+        amplitude = day_range / close[-2]
+        if amplitude > 0.10:
+            continue
+        # 7) 尾盘急拉：收盘接近最高且涨幅>8%，次日大概率回调
+        if close_pos > 0.95 and daily_ret > 0.08:
+            continue
+        # 8) 5日ATR波动率过高（>5%）：高波动股票隔夜风险大
+        if n >= 6:
+            tr = np.maximum(high[-5:] - low[-5:],
+                            np.maximum(np.abs(high[-5:] - close[-6:-1]),
+                                       np.abs(low[-5:] - close[-6:-1])))
+            atr5 = tr.mean()
+            if atr5 / close[-1] > 0.05:
+                continue
 
         dif, dea, hist = calc_macd(close)
 
@@ -709,8 +739,6 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
         else:
             status = "拐头中"
 
-        latest_date = df["date"].iloc[-1]
-
         candidates.append({
             "ticker": ticker,
             "price": close[-1],
@@ -762,8 +790,16 @@ def output_result(top):
     print("-" * 112)
     print()
     print("  MACD 反转选股逻辑（买在底部拐点）:")
-    print("  ┌─ 必要条件 ─────────────────────────────────────────┐")
-    print("  │  极端行情过滤（单日涨跌 >25% 排除）                 │")
+    print("  ┌─ 隔夜安全过滤 ──────────────────────────────────────┐")
+    print("  │  ✗ 单日涨跌>15% = 事件驱动，隔夜风险极高           │")
+    print("  │  ✗ 收盘偏高（> 日内均价×1.05）= 追高风险           │")
+    print("  │  ✗ 异常放量（量比>5）= 财报/消息驱动               │")
+    print("  │  ✗ 收盘低位（日内位置<20%）= 尾盘抛售              │")
+    print("  │  ✗ 跳空高开（开盘>昨收×1.05）= 缺口回补风险        │")
+    print("  │  ✗ 振幅过大（>10%）= 波动太大隔夜不确定            │")
+    print("  │  ✗ 尾盘急拉（收盘近最高且涨>8%）= 次日回调         │")
+    print("  │  ✗ 5日ATR/股价>5% = 高波动股票隔夜风险大           │")
+    print("  ├─ 必要条件 ────────────────────────────────────────┤")
     print("  │  至少满足一个主要反转信号                            │")
     print("  ├─ 主要反转信号 ─────────────────────────────────────┤")
     print("  │  ★★ 底背离 = 股价新低 但 MACD 不新低       +0.25  │")

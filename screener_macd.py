@@ -244,11 +244,12 @@ def online_score(rq_ids):
         print("  沪深300 获取失败且无缓存，相对强度因子设为 0")
         print(f"  cache_key 回退为: {cache_key}")
 
-    # 检查缓存新鲜度：在线数据可用时，抽样验证缓存中数据日期是否匹配
+    # 检查缓存新鲜度：在线数据可用时，确保缓存是最新交易日的数据
     force_refresh = False
     if idx_df is not None and len(idx_df) >= 5:
         ck_dir = _CACHE_DIR / cache_key
         if ck_dir.exists():
+            # cache_key 目录已存在：抽样检查里面的数据是否真的到了 cache_key 日期
             sample_csvs = [
                 p for p in ck_dir.glob("*.csv") if not p.stem.startswith("_")
             ]
@@ -261,6 +262,10 @@ def online_score(rq_ids):
                         print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
                 except Exception:
                     pass
+        elif local_key and local_key != cache_key:
+            # cache_key 目录不存在，但 local_key 目录有旧数据：新交易日需要刷新
+            force_refresh = True
+            print(f"  ⚠ 新交易日 {cache_key}，缓存为 {local_key}，需要下载最新数据")
 
     # 检查缓存情况（同时查 cache_key 和 local_key 目录）
     if force_refresh:
@@ -355,27 +360,48 @@ def online_score(rq_ids):
             continue
 
         close = df["close"].values
+        opn = df["open"].values
         volume = df["volume"].values
         high = df["high"].values
         low = df["low"].values
         latest_date = df["date"].iloc[-1]
         n = len(close)
 
-        if close[-1] == 0:
+        if close[-1] == 0 or n < 2:
             continue
 
+        daily_ret = close[-1] / close[-2] - 1
+
         # ===== T+1 安全过滤 =====
-        if n >= 2 and close[-1] / close[-2] - 1 > 0.095:
+        # 1) 涨停：买不进或次日大概率高开低走
+        if daily_ret > 0.095:
             continue
+        # 2) 接近跌停：次日可能继续跌停，T+1 无法止损
+        if daily_ret < -0.08:
+            continue
+        # 3) 收盘偏高于日内均价：追高买入风险大
         day_avg = (high[-1] + low[-1] + close[-1]) / 3
         if close[-1] > day_avg * 1.03:
             continue
+        # 4) 异常放量（量比>3）：可能是主力出货或消息驱动
         vol_prev_avg = volume[-6:-1].mean() if n >= 6 else volume[:-1].mean()
         if vol_prev_avg > 0 and volume[-1] / vol_prev_avg > 3.0:
             continue
+        # 5) 收盘在日内低位（<25%）：尾盘跳水，次日惯性向下
         day_range = high[-1] - low[-1]
         close_pos = (close[-1] - low[-1]) / day_range if day_range > 0 else 0.5
         if close_pos < 0.25:
+            continue
+        # 6) 大幅跳空高开（>3%）：次日有缺口回补风险
+        gap_up = opn[-1] / close[-2] - 1
+        if gap_up > 0.03:
+            continue
+        # 7) 振幅过大（>8%）：日内波动太大，隔夜风险高
+        amplitude = day_range / close[-2]
+        if amplitude > 0.08:
+            continue
+        # 8) 尾盘急拉：收盘接近最高价且涨幅>5%，次日大概率低开
+        if close_pos > 0.95 and daily_ret > 0.05:
             continue
 
         # 计算 MACD
@@ -572,8 +598,16 @@ def output_result(top):
     print("-" * 112)
     print()
     print("  MACD 反转选股逻辑（买在底部拐点）:")
-    print("  ┌─ 必要条件 ─────────────────────────────────────────┐")
-    print("  │  非涨停（T+1 安全）                                 │")
+    print("  ┌─ T+1 安全过滤（买入后次日才能卖出）────────────────┐")
+    print("  │  ✗ 涨停（涨幅>9.5%）= 买不进或次日高开低走         │")
+    print("  │  ✗ 接近跌停（跌幅>8%）= 次日可能继续跌停无法止损   │")
+    print("  │  ✗ 收盘偏高（> 日内均价×1.03）= 追高风险           │")
+    print("  │  ✗ 异常放量（量比>3）= 可能主力出货                │")
+    print("  │  ✗ 收盘低位（日内位置<25%）= 尾盘跳水惯性向下      │")
+    print("  │  ✗ 跳空高开（开盘>昨收×1.03）= 缺口回补风险        │")
+    print("  │  ✗ 振幅过大（振幅>8%）= 日内波动大隔夜风险高       │")
+    print("  │  ✗ 尾盘急拉（收盘近最高且涨>5%）= 次日大概率低开   │")
+    print("  ├─ 必要条件 ────────────────────────────────────────┤")
     print("  │  至少满足一个主要反转信号                            │")
     print("  ├─ 主要反转信号 ─────────────────────────────────────┤")
     print("  │  ★★ 底背离 = 股价新低 但 MACD 不新低       +0.25  │")
@@ -585,7 +619,7 @@ def output_result(top):
     print("  │      DIF 拐头向上                            +0.08  │")
     print("  │      放量反弹 = 资金介入                     +0.08  │")
     print("  │      DIF 接近零轴 = 快要翻多                 +0.07  │")
-    print("  ├─ 过滤 + 因子（与回测 v3 一致）──────────────────────┤")
+    print("  ├─ 过滤 + 因子 ──────────────────────────────────────┤")
     print("  │  ✓ 短期动量确认: close ≥ EMA5 × 0.99        过滤  │")
     print("  │      相对强度 = 近5日跑赢大盘越多越好        +0.05  │")
     print("  │      成交额因子 = 大成交额信号更可靠         +0.05  │")
