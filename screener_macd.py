@@ -401,8 +401,8 @@ def online_score(rq_ids):
         amplitude = day_range / close[-2]
         if amplitude > 0.08:
             continue
-        # 8) 尾盘急拉：收盘接近最高价且涨幅>5%，次日大概率低开
-        if close_pos > 0.95 and daily_ret > 0.05:
+        # 8) 尾盘急拉：收盘偏高且涨幅明显，次日大概率低开
+        if close_pos > 0.80 and daily_ret > 0.04:
             continue
 
         # 计算 MACD
@@ -654,7 +654,7 @@ def output_result(top, watch_top=None):
     print("  │  ✗ 收盘低位（日内位置<25%）= 尾盘跳水惯性向下      │")
     print("  │  ✗ 跳空高开（开盘>昨收×1.03）= 缺口回补风险        │")
     print("  │  ✗ 振幅过大（振幅>8%）= 日内波动大隔夜风险高       │")
-    print("  │  ✗ 尾盘急拉（收盘近最高且涨>5%）= 次日大概率低开   │")
+    print("  │  ✗ 尾盘急拉（收盘>80%位且涨>4%）= 次日大概率低开   │")
     print("  ├─ 必要条件 ────────────────────────────────────────┤")
     print("  │  至少满足一个主要反转信号                            │")
     print("  ├─ 主要反转信号 ─────────────────────────────────────┤")

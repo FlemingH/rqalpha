@@ -618,8 +618,8 @@ def score_reversal(bars_dict, tickers, idx_ret5=0.0):
         amplitude = day_range / close[-2]
         if amplitude > 0.10:
             continue
-        # 7) 尾盘急拉：收盘接近最高且涨幅>8%，次日大概率回调
-        if close_pos > 0.95 and daily_ret > 0.08:
+        # 7) 尾盘急拉：收盘偏高且涨幅明显，次日大概率回调
+        if close_pos > 0.80 and daily_ret > 0.06:
             continue
         # 8) 5日ATR波动率过高（>5%）：高波动股票隔夜风险大
         if n >= 6:
@@ -838,7 +838,7 @@ def output_result(top, watch_top=None):
     print("  │  ✗ 收盘低位（日内位置<20%）= 尾盘抛售              │")
     print("  │  ✗ 跳空高开（开盘>昨收×1.05）= 缺口回补风险        │")
     print("  │  ✗ 振幅过大（>10%）= 波动太大隔夜不确定            │")
-    print("  │  ✗ 尾盘急拉（收盘近最高且涨>8%）= 次日回调         │")
+    print("  │  ✗ 尾盘急拉（收盘>80%位且涨>6%）= 次日回调         │")
     print("  │  ✗ 5日ATR/股价>5% = 高波动股票隔夜风险大           │")
     print("  ├─ 必要条件 ────────────────────────────────────────┤")
     print("  │  至少满足一个主要反转信号                            │")
