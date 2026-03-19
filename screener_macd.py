@@ -218,9 +218,24 @@ def online_score(rq_ids):
 
     if idx_df is not None and len(idx_df) >= 5:
         cache_key = str(idx_df["date"].iloc[-1])
+
+        # BaoStock 首次调用可能返回过时数据：如果在线数据与本地缓存日期相同，
+        # 但今天日期更新，说明可能有更新的交易日数据。等待后重试一次验证。
+        if cache_key == local_key and today_str > cache_key:
+            print(f"  ⚠ 在线数据与缓存日期相同 ({cache_key})，可能未更新，等待重试...")
+            time.sleep(5)
+            idx_df2 = fetch_bars("sh.000300", start, today_str)
+            if idx_df2 is not None and len(idx_df2) >= 5:
+                new_key = str(idx_df2["date"].iloc[-1])
+                if new_key > cache_key:
+                    cache_key = new_key
+                    idx_df = idx_df2
+                    print(f"  ✓ 获取到最新交易日: {cache_key}")
+                else:
+                    print(f"  确认 {cache_key} 是最新交易日")
+
         idx_close = idx_df["close"].values
         idx_ret5 = idx_close[-1] / idx_close[-5] - 1
-        _write_cache("_IDX_000300", cache_key, idx_df)
         print(f"  沪深300 近5日涨幅: {idx_ret5:+.2%}")
         print(f"  最新交易日(在线): {cache_key}")
     elif local_key:
@@ -245,27 +260,31 @@ def online_score(rq_ids):
         print(f"  cache_key 回退为: {cache_key}")
 
     # 检查缓存新鲜度：在线数据可用时，确保缓存是最新交易日的数据
+    # 注意：必须在写入指数缓存之前检查，否则 ck_dir 会因为指数文件而提前存在
     force_refresh = False
     if idx_df is not None and len(idx_df) >= 5:
         ck_dir = _CACHE_DIR / cache_key
+        stock_csvs = []
         if ck_dir.exists():
-            # cache_key 目录已存在：抽样检查里面的数据是否真的到了 cache_key 日期
-            sample_csvs = [
+            stock_csvs = [
                 p for p in ck_dir.glob("*.csv") if not p.stem.startswith("_")
             ]
-            if sample_csvs:
-                try:
-                    sdf = pd.read_csv(sample_csvs[0])
-                    cached_last = str(sdf["date"].iloc[-1])
-                    if cached_last < cache_key:
-                        force_refresh = True
-                        print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
-                except Exception:
-                    pass
+        if stock_csvs:
+            try:
+                sdf = pd.read_csv(stock_csvs[0])
+                cached_last = str(sdf["date"].iloc[-1])
+                if cached_last < cache_key:
+                    force_refresh = True
+                    print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
+            except Exception:
+                pass
         elif local_key and local_key != cache_key:
-            # cache_key 目录不存在，但 local_key 目录有旧数据：新交易日需要刷新
             force_refresh = True
             print(f"  ⚠ 新交易日 {cache_key}，缓存为 {local_key}，需要下载最新数据")
+
+    # 写入指数缓存（放在 force_refresh 检查之后，避免提前创建 cache_key 目录）
+    if idx_df is not None and len(idx_df) >= 5:
+        _write_cache("_IDX_000300", cache_key, idx_df)
 
     # 检查缓存情况（同时查 cache_key 和 local_key 目录）
     if force_refresh:

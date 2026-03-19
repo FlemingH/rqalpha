@@ -383,6 +383,20 @@ def fetch_us_bars(tickers, days=100):
 
     if online_key:
         cache_key = online_key
+
+        # Stooq 首次调用可能返回过时数据：如果在线与本地缓存日期相同，
+        # 但今天日期更新，等待后重试一次验证。
+        if cache_key == local_key and end_str > cache_key:
+            print(f"  ⚠ 在线数据与缓存日期相同 ({cache_key})，可能未更新，等待重试...")
+            time.sleep(5)
+            new_key = _detect_latest_trading_day_online(start_str, end_str)
+            if new_key and new_key > cache_key:
+                cache_key = new_key
+                online_key = new_key
+                print(f"  ✓ 获取到最新交易日: {cache_key}")
+            else:
+                print(f"  确认 {cache_key} 是最新交易日")
+
         print(f"  数据范围: {start_str} ~ {end_str}  (最新交易日: {cache_key})")
     elif local_key:
         cache_key = local_key
@@ -398,22 +412,24 @@ def fetch_us_bars(tickers, days=100):
     rate_limited = False
 
     # 检查缓存新鲜度：在线数据可用时，确保缓存是最新交易日的数据
+    # 统一逻辑：先检查 cache_key 目录里有没有真正的股票 CSV（排除 _ 开头的指数文件）
     force_refresh = False
     if online_key:
         ck_dir = _CACHE_DIR / cache_key
+        stock_csvs = []
         if ck_dir.exists():
-            sample_csvs = [
+            stock_csvs = [
                 p for p in ck_dir.glob("*.csv") if not p.stem.startswith("_")
             ]
-            if sample_csvs:
-                try:
-                    sdf = pd.read_csv(sample_csvs[0])
-                    cached_last = str(sdf["date"].iloc[-1])
-                    if cached_last < cache_key:
-                        force_refresh = True
-                        print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
-                except Exception:
-                    pass
+        if stock_csvs:
+            try:
+                sdf = pd.read_csv(stock_csvs[0])
+                cached_last = str(sdf["date"].iloc[-1])
+                if cached_last < cache_key:
+                    force_refresh = True
+                    print(f"  ⚠ 缓存数据过期 (截止 {cached_last}, 应为 {cache_key})，强制重新下载")
+            except Exception:
+                pass
         elif local_key and local_key != cache_key:
             force_refresh = True
             print(f"  ⚠ 新交易日 {cache_key}，缓存为 {local_key}，需要下载最新数据")
