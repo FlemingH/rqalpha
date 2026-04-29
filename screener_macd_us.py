@@ -434,20 +434,19 @@ def fetch_us_bars(tickers, days=100):
             force_refresh = True
             print(f"  ⚠ 新交易日 {cache_key}，缓存为 {local_key}，需要下载最新数据")
 
-    # 搜索当前 cache_key 目录，以及 local_key 目录（可能不同）
+    # 搜索当前 cache_key 目录
     if force_refresh:
         need_download = list(tickers)
         have_cache = []
         print(f"  本地缓存: 已失效, 需下载: {len(need_download)} 只")
     else:
         cached_files = set()
-        for key in set(filter(None, [cache_key, local_key])):
-            cache_dir = _CACHE_DIR / key
-            if cache_dir.exists():
-                cached_files.update(
-                    p.stem for p in cache_dir.glob("*.csv")
-                    if not p.stem.startswith("_")
-                )
+        cache_dir = _CACHE_DIR / cache_key
+        if cache_dir.exists():
+            cached_files.update(
+                p.stem for p in cache_dir.glob("*.csv")
+                if not p.stem.startswith("_")
+            )
         need_download = [t for t in tickers if t not in cached_files]
         have_cache = [t for t in tickers if t in cached_files]
         print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
@@ -456,8 +455,6 @@ def fetch_us_bars(tickers, days=100):
     cache_dates = set()
     for ticker in tqdm(have_cache, desc="  读缓存", ncols=70, disable=not have_cache):
         df = _read_cache(ticker, cache_key)
-        if df is None and local_key and local_key != cache_key:
-            df = _read_cache(ticker, local_key)
         if df is not None and len(df) >= 26:
             results[ticker] = df
             from_cache += 1

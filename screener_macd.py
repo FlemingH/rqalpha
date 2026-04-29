@@ -286,20 +286,19 @@ def online_score(rq_ids):
     if idx_df is not None and len(idx_df) >= 5:
         _write_cache("_IDX_000300", cache_key, idx_df)
 
-    # 检查缓存情况（同时查 cache_key 和 local_key 目录）
+    # 检查缓存情况
     if force_refresh:
         need_download = list(rq_ids)
         have_cache = []
         print(f"  本地缓存: 已失效, 需下载: {len(need_download)} 只")
     else:
         cached_ids = set()
-        for key in set(filter(None, [cache_key, local_key])):
-            d = _CACHE_DIR / key
-            if d.exists():
-                cached_ids.update(
-                    p.stem.replace("_", ".") for p in d.glob("*.csv")
-                    if not p.stem.startswith("_")
-                )
+        d = _CACHE_DIR / cache_key
+        if d.exists():
+            cached_ids.update(
+                p.stem.replace("_", ".") for p in d.glob("*.csv")
+                if not p.stem.startswith("_")
+            )
         need_download = [rid for rid in rq_ids if rid not in cached_ids]
         have_cache = [rid for rid in rq_ids if rid in cached_ids]
         print(f"  本地缓存: {len(have_cache)} 只, 需下载: {len(need_download)} 只")
@@ -310,6 +309,8 @@ def online_score(rq_ids):
     net_failed = []
     base_sleep = 0.3
     net_dates = set()
+    results = {}  # 保存所有可用数据，避免污染新缓存目录
+    
     for rq_id in tqdm(need_download, desc="  下载中", ncols=70, file=sys.stdout,
                       disable=not need_download):
         if consecutive_fail >= 10:
@@ -327,6 +328,7 @@ def online_score(rq_ids):
         df = fetch_bars(bs_code, start, today_str)
         if df is not None and len(df) >= 26:
             _write_cache(rq_id, cache_key, df)
+            results[rq_id] = df
             from_net += 1
             net_dates.add(_data_date(df))
             consecutive_fail = 0
@@ -334,17 +336,18 @@ def online_score(rq_ids):
             net_failed.append(rq_id)
             consecutive_fail += 1
 
-    # 第 2 轮：从缓存读取（跨 cache_key / local_key 目录）
+    # 第 2 轮：从缓存读取
     from_cache = 0
     cache_dates = set()
     for rq_id in have_cache:
         df = _read_cache(rq_id, cache_key)
-        if df is None and local_key and local_key != cache_key:
-            df = _read_cache(rq_id, local_key)
         if df is not None and len(df) >= 26:
-            _write_cache(rq_id, cache_key, df)
+            results[rq_id] = df
             from_cache += 1
             cache_dates.add(_data_date(df))
+        else:
+            # 理论上不应发生，但如果缓存损坏，加入失败列表兜底
+            net_failed.append(rq_id)
 
     # 第 3 轮：网络失败的从所有历史缓存兜底
     from_old = 0
@@ -352,7 +355,7 @@ def online_score(rq_ids):
     if net_failed:
         old_data = _find_all_cached(net_failed, today_str)
         for rq_id, df in old_data.items():
-            _write_cache(rq_id, cache_key, df)
+            results[rq_id] = df
             from_old += 1
             old_dates.add(_data_date(df))
 
@@ -368,13 +371,13 @@ def online_score(rq_ids):
     print(f"  │  合计可用: {from_cache + from_net + from_old:>4} / {len(rq_ids)} 只                  │")
     print(f"  └───────────────────────────────────────────┘")
 
-    # 统一从缓存读取并分析
+    # 统一分析
     candidates = []
     watchlist = []
     analyze_fail = 0
 
     for rq_id in tqdm(rq_ids, desc="  分析中", ncols=70, file=sys.stdout):
-        df = _read_cache(rq_id, cache_key)
+        df = results.get(rq_id)
         if df is None or len(df) < 26:
             analyze_fail += 1
             continue
